@@ -1,0 +1,46 @@
+# rules.yaml
+#
+# This file defines rules for parsing and categorizing log messages.
+# It is used by make_report.sh to generate a structured report from log analysis.
+#
+# Each rule has:
+# - name: A human-readable name for the category of errors.
+# - pattern: A regex pattern (case-insensitive) to match against log lines.
+# - level: The severity level (e.g., crit, warn, info).
+# - description: A brief explanation of what the rule catches.
+
+rules:
+  - name: "CPU Machine Check Errors"
+    pattern: "(mce|machine check error)"
+    level: "crit"
+    description: "Catches critical CPU hardware errors (MCE) that may indicate imminent failure."
+
+  - name: "Memory ECC Errors"
+    pattern: "(edac|ecc)"
+    level: "crit"
+    description: "Catches correctable and uncorrectable memory errors reported by EDAC."
+
+  - name: "Storage I/O Errors"
+    pattern: "(i/o error|task hung|corrupted|nvme.*status|scsi.*error|ext4-fs error)"
+    level: "crit"
+    description: "Matches critical errors related to disk I/O, filesystem corruption, or device failures."
+
+  - name: "NVIDIA GPU Errors"
+    pattern: "(nvrm|xid|nvidia-modeset.*failed)"
+    level: "warn"
+    description: "Catches common NVIDIA driver errors (Xid) and modesetting failures, which may indicate GPU instability."
+
+  - name: "CIFS/Samba Errors"
+    pattern: "(cifs|smbd)"
+    level: "warn"
+    description: "Matches errors related to the CIFS/Samba service, common on storage servers."
+
+  - name: "Application Segfaults"
+    pattern: "(segfault|segmentation fault)"
+    level: "warn"
+    description: "Catches application or system process crashes (segmentation faults)."
+
+  - name: "General Kernel Warnings"
+    pattern: "(kernel: warn|tainted kernel)"
+    level: "info"
+    description: "General kernel-level warnings that are good to know but not immediately critical."

@@ -1,0 +1,70 @@
+# rules_multi_host.yaml (for jfcrh multi-host)
+
+categories:
+  # CIFS / SMB 類（網路不可達、逾時/重連、協定不相容）
+  CIFS_NETWORK_DOWN:
+    - 'CIFS: VFS: .*cifs_mount failed w/return code = -113'
+    - 'CIFS: VFS: Error connecting to socket. Aborting operation.'
+    - 'CIFS: VFS: \[^ ]+ has not responded in [0-9]+ seconds. Reconnecting'
+  CIFS_PROTOCOL_COMPAT:
+    - 'Dialect not supported'
+    - 'cifs_mount failed w/return code = -95'
+
+  # systemd 掛載失敗（不論原因）
+  SYSTEMD_MOUNT_FAIL:
+    - 'systemd\[.*]: Failed to mount .'
+
+  # 安全/認證類
+  SUDO_AUTH:
+    - 'sudo\[.*]: .*incorrect password'
+  SSHD_WARN:
+    - 'sshd\[.*]: error: kex_exchange_identification: Connection closed by remote host'
+
+  # 網路/容器介面遺失（多見於 Docker/veth/bridge）
+  NET_IFACE_MISSING:
+    - 'networkctl\[.*]: Interface "veth[a-f0-9]+"'       # veth*
+    - 'networkctl\[.*]: Interface "docker0" not found'
+    - 'networkctl\[.*]: Interface "br-[a-f0-9]+"'        # docker bridge
+    - 'Interface "veth[a-f0-9]+" not found'
+
+  # fwupd / motd（低風險噪音）
+  FWUPD_MOTD:
+    - 'Failed to start Refresh fwupd metadata and update motd'
+
+  # smartd 郵件 hook 缺失（資訊級，但常反覆）
+  SMARTD_MAIL_MISSING:
+    - 'smartd\[.*]: Your system does not have /usr/bin/mail.  Install the mailx or mailutils package'
+    - 'smartd\[.*]: run-parts: /etc/smartmontools/run.d/10mail exited with return code 1'
+    - 'smartd\[.*]: Warning via /usr/share/smartmontools/smartd-runner to root .*failed.*'
+    - 'smartd\[.*]: Warning via /usr/share/smartmontools/smartd-runner to root produced unexpected output'
+
+  # 一般 smartd 資訊（非錯誤）
+  SMARTD_INFO:
+    - 'smartd\[.*]: .*'
+
+  OTHER:
+    - '.*'
+
+weights:
+  CIFS_NETWORK_DOWN: 35
+  CIFS_PROTOCOL_COMPAT: 20
+  SYSTEMD_MOUNT_FAIL: 20
+  SUDO_AUTH: 10
+  SSHD_WARN: 5
+  NET_IFACE_MISSING: 5
+  FWUPD_MOTD: 2
+  SMARTD_MAIL_MISSING: 3
+  SMARTD_INFO: 1
+  OTHER: 0
+
+heatmap_order:
+  - CIFS_NETWORK_DOWN
+  - CIFS_PROTOCOL_COMPAT
+  - SYSTEMD_MOUNT_FAIL
+  - SUDO_AUTH
+  - SSHD_WARN
+  - NET_IFACE_MISSING
+  - FWUPD_MOTD
+  - SMARTD_MAIL_MISSING
+  - SMARTD_INFO
+  - OTHER
