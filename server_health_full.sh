@@ -792,8 +792,10 @@ check_psu() {
     local sel_out
     sel_out=$(ipmi_try sel list 2>/dev/null | egrep -i 'psu|power fail|volt fail|fault' || true)
     echo "$sel_out" > "$sel_log"
-    local sel_count
-    sel_count=$(echo "$sel_out" | wc -l)
+    local sel_count=0
+    if [[ -n "$sel_out" ]]; then
+        sel_count=$(echo "$sel_out" | wc -l)
+    fi
 
     # --- Determine Status ---
     local final_status="PASS"
@@ -1663,6 +1665,7 @@ check_fans() {
     local deviation_crit_count=0
     local metrics_json_array=()
     local reason_details=()
+    local fan_summary_array=() # For PASS reason summary
     local needs_baseline_update=0
 
     # --- Process OS-level `sensors` data ---
@@ -1718,6 +1721,8 @@ check_fans() {
             if (( current_rpm < FAN_RPM_TH )); then
                 ((low_rpm_count++)); fan_status="WARN (<${FAN_RPM_TH}RPM)"; reason_details+=("${fan_name}:${current_rpm}RPM")
             fi
+            fan_summary_array+=("${fan_name}:${current_rpm}RPM")
+            echo "DEBUG FAN: name='$fan_name', rpm='$current_rpm', threshold='$FAN_RPM_TH'" >&2
 
             metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --arg bsrc "ipmi" \
                 '{name:$name, status:$status, current_rpm:$rpm, baseline_source:$bsrc}') )
@@ -1744,6 +1749,8 @@ check_fans() {
     elif (( deviation_warn_count > 0 )); then
          final_status="WARN"
          final_reason="風扇轉速警告: ${deviation_warn_count} 個偏差>20%. (${reason_details[*]})."
+    elif (( ${#fan_summary_array[@]} > 0 )); then
+        final_reason+=". Details: $(IFS=,; echo "${fan_summary_array[*]}")"
     fi
 
     local final_json
