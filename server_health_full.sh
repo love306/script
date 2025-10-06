@@ -1147,6 +1147,7 @@ check_disks() {
 
     # --- Software RAID Check ---
     local mdstat_status="NA" mdstat_reason=""
+    local mdstat_json="null"
     if [[ -r /proc/mdstat ]]; then
         mdstat_status="PASS"
         mdstat_reason="mdadm status is clean."
@@ -1627,7 +1628,7 @@ check_fans() {
     declare -A SDR_BASELINE_RPM
     local ipmi_sdr_out=""
     if (( ! SKIP_BMC )); then
-        ipmi_sdr_out=$(ipmi_try sdr elist fan)
+        ipmi_sdr_out=$(ipmi_try sdr type Fan)
         if [[ $? -eq 0 && -n "$ipmi_sdr_out" ]]; then
             echo "$ipmi_sdr_out" > "$raw_ipmi_sdr_log"
             local current_fan=""
@@ -1805,6 +1806,10 @@ check_env() {
     while IFS= read -r line; do
         [[ -z "$line" || "$line" != *"|"* ]] && continue
         line=${line%$'\r'}
+
+        # [FIX] Only process lines that are actual temperature readings in Celsius
+        echo "$line" | grep -q -i "degrees C" || continue
+
         IFS='|' read -r raw_name _ raw_status _ raw_value _ <<< "$line"
         local name value_field temp_val name_lower
         name=$(printf '%s' "${raw_name:-}" | trim)
@@ -2494,6 +2499,24 @@ consolidate_report() {
     elif [[ "$st" == "FAIL" ]]; then color="$C_RED"
     fi
     printf "%-4s %-24s ${color}%-8s${C_RESET} %s\n" "$i" "${ITEM_NAME[$i]}" "$st" "${FINAL_REASON[$i]}"
+
+    # For WARN or FAIL, print additional info
+    if [[ "$st" == "WARN" || "$st" == "FAIL" ]]; then
+      # Print Tips if they exist
+      if [[ -n "${FINAL_TIPS_MAP[$i]:-}" ]]; then
+        echo -e "     ${C_BLUE}TIPS:${C_RESET}"
+        # Use sed to indent
+        echo "${FINAL_TIPS_MAP[$i]}" | sed 's/^/       /'
+      fi
+
+      # Print Evidence log paths if they exist
+      local evidence_json
+      evidence_json=$(echo "${ALL_CHECK_RESULTS[$i]:-}" | jq -c .evidence 2>/dev/null)
+      if [[ -n "$evidence_json" && "$evidence_json" != "null" && "$evidence_json" != "{}" ]]; then
+          echo -e "     ${C_BLUE}LOGS:${C_RESET}"
+          echo "$evidence_json" | jq -r 'to_entries[] | "       \(.key): \(.value)"'
+      fi
+    fi
   done
 
   # 6. Append to Markdown file
