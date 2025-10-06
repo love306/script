@@ -107,6 +107,10 @@ CPU_TEMP_WARN=80
 CPU_TEMP_CRIT=90
 CPU_TEMP_TH=0  # 舊參數（只作 warn）
 
+# 環境溫度閾值 (攝氏)
+ENV_TEMP_WARN=35
+ENV_TEMP_CRIT=40
+
 FAN_RPM_TH=300
 
 NIC_BASELINE_FILE=""
@@ -150,6 +154,8 @@ print_usage() {
     --cpu-temp-th <N>        (舊, = warn)
     --cpu-temp-warn <N>
     --cpu-temp-crit <N>
+    --env-temp-warn <N>      (預設: $ENV_TEMP_WARN)
+    --env-temp-crit <N>      (預設: $ENV_TEMP_CRIT)
     --fan-th <N>
   磁碟 I/O:
     --run-fio
@@ -213,6 +219,8 @@ while [[ $# -gt 0 ]]; do
     --cpu-temp-th) CPU_TEMP_TH="$2"; shift 2;;
     --cpu-temp-warn) CPU_TEMP_WARN="$2"; shift 2;;
     --cpu-temp-crit) CPU_TEMP_CRIT="$2"; shift 2;;
+    --env-temp-warn) ENV_TEMP_WARN="$2"; shift 2;;
+    --env-temp-crit) ENV_TEMP_CRIT="$2"; shift 2;;
     --fan-th) FAN_RPM_TH="$2"; shift 2;;
     --run-fio) RUN_FIO=1; shift;;
     --fio-file) FIO_FILE="$2"; shift 2;;
@@ -1862,7 +1870,7 @@ check_env() {
         if [[ "$name_lower" =~ $exclude_regex ]]; then
             continue
         fi
-        local entry="${name}|${temp_val}|35|40"
+        local entry="${name}|${temp_val}|${ENV_TEMP_WARN}|${ENV_TEMP_CRIT}"
         if [[ "$name_lower" =~ $include_regex ]]; then
             primary_sensor_lines+=("$entry")
         else
