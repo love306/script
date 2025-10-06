@@ -2500,22 +2500,19 @@ consolidate_report() {
     fi
     printf "%-4s %-24s ${color}%-8s${C_RESET} %s\n" "$i" "${ITEM_NAME[$i]}" "$st" "${FINAL_REASON[$i]}"
 
-    # For WARN or FAIL, print additional info
-    if [[ "$st" == "WARN" || "$st" == "FAIL" ]]; then
-      # Print Tips if they exist
-      if [[ -n "${FINAL_TIPS_MAP[$i]:-}" ]]; then
-        echo -e "     ${C_BLUE}TIPS:${C_RESET}"
-        # Use sed to indent
-        echo "${FINAL_TIPS_MAP[$i]}" | sed 's/^/       /'
-      fi
+    # Print Tips if they exist
+    if [[ -n "${FINAL_TIPS_MAP[$i]:-}" ]]; then
+      echo -e "     ${C_BLUE}TIPS:${C_RESET}"
+      # Use sed to indent
+      echo "${FINAL_TIPS_MAP[$i]}" | sed 's/^/       /'
+    fi
 
-      # Print Evidence log paths if they exist
-      local evidence_json
-      evidence_json=$(echo "${ALL_CHECK_RESULTS[$i]:-}" | jq -c .evidence 2>/dev/null)
-      if [[ -n "$evidence_json" && "$evidence_json" != "null" && "$evidence_json" != "{}" ]]; then
-          echo -e "     ${C_BLUE}LOGS:${C_RESET}"
-          echo "$evidence_json" | jq -r 'to_entries[] | "       \(.key): \(.value)"'
-      fi
+    # Print Evidence log paths if they exist
+    local evidence_json
+    evidence_json=$(echo "${ALL_CHECK_RESULTS[$i]:-}" | jq -c .evidence 2>/dev/null)
+    if [[ -n "$evidence_json" && "$evidence_json" != "null" && "$evidence_json" != "{}" ]]; then
+        echo -e "     ${C_BLUE}LOGS:${C_RESET}"
+        echo "$evidence_json" | jq -r 'to_entries[] | "       \(.key): \(.value)"'
     fi
   done
 
