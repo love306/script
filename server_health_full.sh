@@ -1096,9 +1096,9 @@ check_disks() {
             health_status="WARN"
         fi
 
-        local reallocated=$(echo "$smart_output" | grep 'Reallocated_Sector_Ct' | awk '{print $10}' || echo 0)
-        local pending=$(echo "$smart_output" | grep 'Current_Pending_Sector' | awk '{print $10}' || echo 0)
-        local power_on=$(echo "$smart_output" | grep 'Power_On_Hours' | awk '{print $10}' || echo 0)
+        local reallocated; reallocated=$(echo "$smart_output" | awk '/Reallocated_Sector_Ct/ {print $10}'); [[ -z "$reallocated" ]] && reallocated=0
+        local pending; pending=$(echo "$smart_output" | awk '/Current_Pending_Sector/ {print $10}'); [[ -z "$pending" ]] && pending=0
+        local power_on; power_on=$(echo "$smart_output" | awk '/Power_On_Hours/ {print $10}'); [[ -z "$power_on" ]] && power_on=0
 
         if (( reallocated > 0 || pending > 0 )); then
             health_status="WARN"
@@ -1187,13 +1187,17 @@ check_disks() {
         --argjson hwrail "$RAID_SUMMARY_JSON" \
         '{smart_devices:$smart, nvme_devices:$nvme, software_raid:$mdstat, hardware_raid:$hwrail}')
 
+    local evidence_json
+    evidence_json=$(jq -n --arg main_log "$LOG_TXT" '{main_output_log:$main_log}')
+
     local final_json
     final_json=$(jq -n \
         --arg status "$overall_status" \
         --arg item "$item" \
         --argjson metrics "$metrics_json" \
         --arg reason "$final_reason" \
-        '{status: $status, item: $item, metrics: $metrics, reason: $reason}')
+        --argjson evidence "$evidence_json" \
+        '{status: $status, item: $item, metrics: $metrics, reason: $reason, evidence: $evidence}')
 
     set_check_result 2 "$final_json"
 }
@@ -1619,62 +1623,39 @@ check_fans() {
     local metrics_path="${metrics_dir}/metrics_${TIMESTAMP}.json"
     mkdir -p "${metrics_dir}"
 
-    # Get current sensor data
+    # Get OS-level sensor data
     local fan_out
     fan_out=$(sensors 2>/dev/null | egrep -i '^fan[0-9a-zA-Z]+:' || true)
     echo "$fan_out"
 
-    # Get IPMI SDR data for baselines
-    declare -A SDR_BASELINE_RPM
+    # Get IPMI-level SDR data
     local ipmi_sdr_out=""
     if (( ! SKIP_BMC )); then
-        ipmi_sdr_out=$(ipmi_try sdr type Fan)
-        if [[ $? -eq 0 && -n "$ipmi_sdr_out" ]]; then
-            echo "$ipmi_sdr_out" > "$raw_ipmi_sdr_log"
-            local current_fan=""
-            while read -r line; do
-                if [[ "$line" =~ ^[[:space:]]*([^|]+) ]]; then
-                    current_fan=$(echo "${BASH_REMATCH[1]}" | xargs | tr ' ' '_' | tr -d '-')
-                fi
-                if [[ -n "$current_fan" && "$line" =~ Nominal\ Reading ]]; then
-                    local nominal_rpm=$(echo "$line" | grep -oP '[0-9]+' | head -n1)
-                    if [[ -n "$nominal_rpm" && "$nominal_rpm" -gt 0 ]]; then
-                        SDR_BASELINE_RPM["$current_fan"]=$nominal_rpm
-                    fi
-                    current_fan=""
-                fi
-            done <<< "$ipmi_sdr_out"
-        fi
+        ipmi_sdr_out=$(ipmi_try sdr elist | grep -i fan)
+        echo "$ipmi_sdr_out" > "$raw_ipmi_sdr_log"
+        echo "$ipmi_sdr_out"
     fi
 
-    # Read or create file-based baseline
+    # If no data from either source, exit with INFO and evidence
+    if [[ -z "$fan_out" && -z "$ipmi_sdr_out" ]]; then
+        local reason="無 OS (sensors) 風扇資料, 且 IPMI 未回傳風扇資訊"
+        local evidence
+        evidence=$(jq -n --arg sensors_log "$raw_sensors_log" --arg ipmi_log "$raw_ipmi_sdr_log" \
+            '{sensors_log_attempt:$sensors_log, ipmi_sdr_log_attempt:$ipmi_log}')
+        local info_json
+        info_json=$(jq -n --arg item "$item" --arg reason "$reason" --argjson evidence "$evidence" \
+            '{status:"INFO", item:$item, reason:$reason, evidence:$evidence}')
+        set_check_result 7 "$info_json"
+        return
+    fi
+
+    # Read or create file-based baseline from previous OS-level sensor readings
     declare -A FILE_BASELINE_RPM
     if [[ -f "$baseline_path" && "${RE_BASELINE:-false}" != "true" ]]; then
         mapfile -t fan_keys < <(jq -r 'keys[]' "$baseline_path" 2>/dev/null || true)
         for key in "${fan_keys[@]}"; do
             FILE_BASELINE_RPM["$key"]=$(jq -r ".\"$key\"" "$baseline_path")
         done
-    fi
-
-    if [[ -z "$fan_out" ]]; then
-        set_check_result 7 "$(jq -n --arg item "$item" '{status:"INFO", item:$item, reason:"無 sensors 風扇資料"}')"
-        return
-    fi
-
-    # --- Historical Analysis ---
-    local history_days="$LOG_DAYS"
-    local historical_files
-    mapfile -t historical_files < <(find "$metrics_dir" -name "metrics_*.json" -mtime -"$history_days" 2>/dev/null)
-    local historical_stats_json='{}'
-    if [[ ${#historical_files[@]} -gt 0 ]]; then
-        historical_stats_json=$(jq -s '
-            map(.metrics[]) | group_by(.name) | map({
-                (.[0].name): {
-                    peak_rpm: (map(.current_rpm) | max),
-                    avg_rpm: ((map(.current_rpm) | add) / length)
-                }
-            }) | add
-        ' "${historical_files[@]}")
     fi
 
     local low_rpm_count=0
@@ -1684,6 +1665,7 @@ check_fans() {
     local reason_details=()
     local needs_baseline_update=0
 
+    # --- Process OS-level `sensors` data ---
     while read -r line; do
         local fan_name=$(echo "$line" | awk -F: '{print $1}' | xargs | tr ' ' '_' | tr -d '-')
         local current_rpm=$(echo "$line" | grep -oP '[0-9]+' | head -n1)
@@ -1691,10 +1673,7 @@ check_fans() {
 
         local baseline_rpm=0
         local baseline_source="none"
-        if [[ -n "${SDR_BASELINE_RPM[$fan_name]:-}" ]]; then
-            baseline_rpm=${SDR_BASELINE_RPM[$fan_name]}
-            baseline_source="sdr"
-        elif [[ -n "${FILE_BASELINE_RPM[$fan_name]:-}" ]]; then
+        if [[ -n "${FILE_BASELINE_RPM[$fan_name]:-}" ]]; then
             baseline_rpm=${FILE_BASELINE_RPM[$fan_name]}
             baseline_source="file"
         else
@@ -1721,24 +1700,47 @@ check_fans() {
             ((deviation_warn_count++)); fan_status="WARN (Dev >20%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct}%")
         fi
         
-        local fan_history
-        fan_history=$(echo "$historical_stats_json" | jq -c --arg name "$fan_name" '.[$name] // null')
-        
-        metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --argjson base_rpm "$baseline_rpm" --arg bsrc "$baseline_source" --argjson dev_pct "$deviation_pct" --argjson history "$fan_history" \
-            '{name:$name, status:$status, current_rpm:$rpm, baseline_rpm:$base_rpm, baseline_source:$bsrc, deviation_pct:$dev_pct, historical_stats:$history}') )
+        metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --argjson base_rpm "$baseline_rpm" --arg bsrc "$baseline_source" --argjson dev_pct "$deviation_pct" \
+            '{name:$name, status:$status, current_rpm:$rpm, baseline_rpm:$base_rpm, baseline_source:$bsrc, deviation_pct:$dev_pct}') )
 
     done <<< "$fan_out"
 
-    if (( needs_baseline_update || "${RE_BASELINE:-false}" == "true" )); then
+    # --- Process IPMI SDR data ---
+    if [[ -n "$ipmi_sdr_out" ]]; then
+        while read -r line; do
+            echo "$line" | grep -q "RPM" || continue
+
+            local fan_name; fan_name=$(echo "$line" | cut -d'|' -f1 | xargs | tr ' ' '_' | tr -d '-')
+            local current_rpm; current_rpm=$(echo "$line" | cut -d'|' -f5 | grep -oE '[0-9]+' | head -n 1)
+            [[ -z "$fan_name" || -z "$current_rpm" ]] && continue
+
+            local fan_status="OK"
+            if (( current_rpm < FAN_RPM_TH )); then
+                ((low_rpm_count++)); fan_status="WARN (<${FAN_RPM_TH}RPM)"; reason_details+=("${fan_name}:${current_rpm}RPM")
+            fi
+
+            metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --arg bsrc "ipmi" \
+                '{name:$name, status:$status, current_rpm:$rpm, baseline_source:$bsrc}') )
+        done <<< "$ipmi_sdr_out"
+    fi
+
+    # [FIX] Corrected if statement syntax
+    if (( needs_baseline_update )) || [[ "${RE_BASELINE:-false}" == "true" ]]; then
         jq -n '$ARGS.positional | . as $a | reduce ($a | length - 1) as $i (-1; . + {($a[$i*2]): ($a[$i*2+1]|tonumber)})' --args "${!FILE_BASELINE_RPM[@]}" "${FILE_BASELINE_RPM[@]}" > "$baseline_path"
         echo "[INFO] Fan baseline updated: $baseline_path"
     fi
 
     local final_status="PASS"
     local final_reason="所有風扇轉速正常"
-    if (( deviation_crit_count > 0 || low_rpm_count > 0 )); then
+    if (( ${#metrics_json_array[@]} == 0 )); then
+        final_reason="從 IPMI/OS 取得風扇資料, 但無法解析出任何 RPM 讀值"
+        final_status="WARN"
+    elif (( low_rpm_count > 0 )); then
+         final_status="WARN"
+         final_reason="風扇轉速警告: ${low_rpm_count} 個風扇轉速低於 ${FAN_RPM_TH} RPM. (${reason_details[*]})."
+    elif (( deviation_crit_count > 0 )); then
          final_status="FAIL"
-         final_reason="風扇嚴重異常: ${deviation_crit_count} 個偏差過大, ${low_rpm_count} 個停轉/過低. (${reason_details[*]})."
+         final_reason="風扇嚴重異常: ${deviation_crit_count} 個偏差過大. (${reason_details[*]})."
     elif (( deviation_warn_count > 0 )); then
          final_status="WARN"
          final_reason="風扇轉速警告: ${deviation_warn_count} 個偏差>20%. (${reason_details[*]})."
@@ -1749,7 +1751,7 @@ check_fans() {
         --arg status "$final_status" \
         --arg item "$item" \
         --arg reason "$final_reason" \
-        --argjson metrics "[$(IFS=,; echo "${metrics_json_array[*]}")]" \
+        --argjson metrics "[$(IFS=,; echo "${metrics_array[*]}")]" \
         --argjson thresholds "{\"low_rpm_th\": ${FAN_RPM_TH}, \"deviation_warn_pct\": 20, \"deviation_crit_pct\": 40}" \
         --argjson evidence "{\"sensors_log\": \"${raw_sensors_log}\", \"ipmi_sdr_log\": \"${raw_ipmi_sdr_log}\", \"baseline_file\": \"${baseline_path}\"}" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
@@ -2122,9 +2124,13 @@ SEL_CRIT=0 SEL_WARN=0 SEL_INFO=0 SEL_NOISE_RAW=0
 SEL_TOP_ARRAY=()          # top sensors
 SEL_CW_EVENTS_ARRAY=()    # 內嵌 CRIT/WARN
 check_bmc() {
+  local item="BMC.SEL"
   echo -e "${C_BLUE}[12] BMC / SEL${C_RESET}"
+
   if (( SKIP_BMC )); then
-    set_status 12 "SKIP" "BMC skipped"
+    local skip_json
+    skip_json=$(jq -n --arg item "$item" '{status:"SKIP", item:$item, reason:"BMC skipped", evidence:{}}')
+    set_check_result 12 "$skip_json"
     return
   fi
 
@@ -2132,22 +2138,32 @@ check_bmc() {
 
   local sel_raw
   sel_raw=$(ipmi_try sel elist 2>/dev/null || ipmi_try sel list 2>/dev/null || echo "")
-  if [[ -z "$sel_raw" ]]; then
-    set_status 12 "WARN" "無法取得 SEL"
-    return
-  fi
+  
+  local evidence
+  evidence=$(jq -n --arg sel_detail "$SEL_DETAIL_FILE" --arg sel_events "$SEL_EVENTS_JSON" \
+    '{sel_detail_log:$sel_detail, sel_events_json:$sel_events}')
 
-  if echo "$sel_raw" | grep -qi 'no entries'; then
-    echo "$sel_raw" > "$SEL_DETAIL_FILE"
-    echo "[SEL] 空 (no entries)"
-    echo '[]' > "$SEL_EVENTS_JSON"
-    SEL_CRIT=0; SEL_WARN=0; SEL_INFO=0; SEL_NOISE_RAW=0
-    set_status 12 "PASS" "SEL 空"
+  if [[ -z "$sel_raw" ]]; then
+    local warn_json
+    warn_json=$(jq -n --arg item "$item" --arg reason "無法取得 SEL" --argjson evidence "$evidence" \
+        '{status:"WARN", item:$item, reason:$reason, evidence:$evidence}')
+    set_check_result 12 "$warn_json"
     return
   fi
 
   echo "$sel_raw" > "$SEL_DETAIL_FILE"
   echo "[Info] SEL 詳細寫入: $SEL_DETAIL_FILE"
+
+  if echo "$sel_raw" | grep -qi 'no entries'; then
+    echo "[SEL] 空 (no entries)"
+    echo '[]' > "$SEL_EVENTS_JSON"
+    SEL_CRIT=0; SEL_WARN=0; SEL_INFO=0; SEL_NOISE_RAW=0
+    local pass_json
+    pass_json=$(jq -n --arg item "$item" --arg reason "SEL 空 (no entries)" --argjson evidence "$evidence" \
+        '{status:"PASS", item:$item, reason:$reason, evidence:$evidence}')
+    set_check_result 12 "$pass_json"
+    return
+  fi
 
   load_severity_map
 
@@ -2259,13 +2275,20 @@ check_bmc() {
     echo "[SEL] Top sensors JSON: $SEL_TOP_JSON"
   fi
 
-  if (( SEL_CRIT>0 )); then
-    set_status 12 "FAIL" "SEL CRIT=$SEL_CRIT WARN=$SEL_WARN"
-  elif (( SEL_WARN>0 )); then
-    set_status 12 "WARN" "SEL WARN=$SEL_WARN"
-  else
-    set_status 12 "PASS" "SEL 無關鍵事件"
+  local final_status="PASS"
+  local final_reason="SEL 無關鍵事件"
+  if (( SEL_CRIT > 0 )); then
+    final_status="FAIL"
+    final_reason="SEL CRIT=$SEL_CRIT WARN=$SEL_WARN"
+  elif (( SEL_WARN > 0 )); then
+    final_status="WARN"
+    final_reason="SEL WARN=$SEL_WARN"
   fi
+
+  local final_json
+  final_json=$(jq -n --arg item "$item" --arg status "$final_status" --arg reason "$final_reason" --argjson evidence "$evidence" \
+    '{status:$status, item:$item, reason:$reason, evidence:$evidence}')
+  set_check_result 12 "$final_json"
 }
 
 # ----------------- 13 Logs -----------------
@@ -2481,12 +2504,8 @@ consolidate_report() {
       fi
     fi
 
-    # 4. Generate tips for FAIL/WARN
-    if [[ "${FINAL_STATUS[$i]}" == "FAIL" || "${FINAL_STATUS[$i]}" == "WARN" ]]; then
-      FINAL_TIPS_MAP[$i]="$(get_item_tips "$i")"
-    else
-      FINAL_TIPS_MAP[$i]=""
-    fi
+    # 4. Generate tips for all statuses
+    FINAL_TIPS_MAP[$i]="$(get_item_tips "$i")"
   done
 
   # 5. Print colored table to stdout
