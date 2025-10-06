@@ -3,6 +3,35 @@
 # server_health_full.sh (v2.2-consolidated)
 # 15 項整合式硬體/系統健檢 (BMC + OS；可整合 UPS)
 #
+#
+# [MOD] Gemini-CLI Interactive Session (2025-10-06):
+# Major refactoring and bug fixing session. Key changes include:
+#
+#  - Reporting Overhaul:
+#    - Implemented a new, robust JSON-based reporting architecture using `set_check_result`.
+#    - Deprecated the legacy `set_status` function.
+#    - Refactored all major check functions (PSU, Disks, Memory, CPU, NIC, Fans, Env, BMC, Logs)
+#      to produce detailed JSON output with metrics and evidence paths.
+#
+#  - Final Report Enhancements:
+#    - The final console report now displays detailed `TIPS` and `LOGS` for all items,
+#      regardless of status, to improve transparency.
+#    - The `Reason` string for passing checks (e.g., Fans) is now enriched with summary data.
+#
+#  - Specific Function Fixes & Improvements:
+#    - PSU: Corrected event counting logic to prevent false warnings from empty logs.
+#    - Disks: Made `storcli64` command output visible on the console for easier debugging.
+#    - Fans:
+#      - Switched to a more compatible IPMI command (`sdr elist | grep`) to find fans.
+#      - Fixed a critical `unbound variable` bug in an `if` condition.
+#      - Added logic to correctly parse RPM data from IPMI `sdr` output.
+#      - Added pipe-separated `DEBUG FAN:` output for consistency.
+#    - Env: Added a filter to only process temperature sensors in Celsius, avoiding misinterpretation of other units.
+#
+#  - New Features:
+#    - Added `--log-days` parameter and a comprehensive `analyze_system_logs` function
+#      for deeper system log analysis.
+#
 # v2.2 新增 / 改進：
 #  - --with-ups（取代語意反直覺的 --ups-check；仍保留相容）
 #  - SEL 解析強化：空 log / 欄位防護 / 空 sensor 避免 bad subscript
@@ -874,7 +903,7 @@ collect_raid_megaraid() {
 
   # 先抓一次 system overview 文字，抽出 model 對照
   local sys_overview
-  sys_overview=$($RAID_STORCLI_CMD show 2>/dev/null || true)
+  sys_overview=$($RAID_STORCLI_CMD show 2>/dev/null | tee /dev/stderr || true)
   declare -A CTL_MODEL
   while read -r line; do
     # 行首有控制器號碼 + 型號 → 取前兩欄
@@ -903,7 +932,7 @@ collect_raid_megaraid() {
     fi
     if [[ ${#ctl_list[@]} -eq 0 ]]; then
       local raw_show
-      raw_show=$($RAID_STORCLI_CMD show 2>/dev/null || true)
+      raw_show=$($RAID_STORCLI_CMD show 2>&1 | tee /dev/stderr || true)
 
       # 先試舊格式: 'Controller = 0'
       mapfile -t ctl_list < <(
@@ -946,7 +975,7 @@ collect_raid_megaraid() {
     local rebuild_pct="" init_pct="" op_flags=()
 
     # 取 controller / VD
-    if $RAID_STORCLI_CMD $ctag show 2>&1 | tee "$raw_c_file" >/dev/null; then
+    if $RAID_STORCLI_CMD $ctag show 2>&1 | tee "$raw_c_file" | tee /dev/stderr >/dev/null; then
       # 解析 Virtual Drive 區塊
       # VD 行範例: "0 VD1 ... Optl" 或 "0 ... Dgrd"
       while read -r line; do
@@ -983,7 +1012,7 @@ collect_raid_megaraid() {
     fi
 
     # 取所有 PD
-    if $RAID_STORCLI_CMD $ctag /eall /sall show 2>&1 | tee "$raw_pd_file" >/dev/null; then
+    if $RAID_STORCLI_CMD $ctag /eall /sall show 2>&1 | tee "$raw_pd_file" | tee /dev/stderr >/dev/null; then
       # 行範例包含 Onln / UGood / Gd / Dhs / Flt / Msng / Ubad / Pred
       while read -r line; do
         [[ "$line" =~ ^[[:space:]]*E[0-9]+:S[0-9]+ ]] || [[ "$line" =~ ^[0-9]+:[0-9]+ ]] || continue
@@ -1721,8 +1750,8 @@ check_fans() {
             if (( current_rpm < FAN_RPM_TH )); then
                 ((low_rpm_count++)); fan_status="WARN (<${FAN_RPM_TH}RPM)"; reason_details+=("${fan_name}:${current_rpm}RPM")
             fi
-            fan_summary_array+=("${fan_name}:${current_rpm}RPM")
-            echo "DEBUG FAN: name='$fan_name', rpm='$current_rpm', threshold='$FAN_RPM_TH'" >&2
+            fan_summary_array+=("${fan_name}|${current_rpm}|${FAN_RPM_TH}")
+            echo "DEBUG FAN: ${fan_name}|${current_rpm}|${FAN_RPM_TH}" >&2
 
             metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --arg bsrc "ipmi" \
                 '{name:$name, status:$status, current_rpm:$rpm, baseline_source:$bsrc}') )
@@ -1750,7 +1779,7 @@ check_fans() {
          final_status="WARN"
          final_reason="風扇轉速警告: ${deviation_warn_count} 個偏差>20%. (${reason_details[*]})."
     elif (( ${#fan_summary_array[@]} > 0 )); then
-        final_reason+=". Details: $(IFS=,; echo "${fan_summary_array[*]}")"
+        final_reason+=". Details: $(IFS=', '; echo "${fan_summary_array[*]}")"
     fi
 
     local final_json
