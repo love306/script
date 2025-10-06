@@ -406,6 +406,14 @@ sel_is_noise(){
 
 trim(){ sed 's/^ *//;s/ *$//' ; }
 
+float_gt(){
+  awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { exit ((a+0) > (b+0)) ? 0 : 1 }'
+}
+
+float_ge(){
+  awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { exit ((a+0) >= (b+0)) ? 0 : 1 }'
+}
+
 last_event_epoch_in_sel(){
   local sel="$1" now_epoch="$2" since_days="$3" regex="$4"
   [[ -z "$sel" || ! -f "$sel" || -z "$regex" ]] && { echo ""; return; }
@@ -1342,19 +1350,48 @@ check_cpu() {
     fi
     echo "$sensors_out" > "$raw_log_path"
 
-    # Parse current metrics
-    local core_temps
-    core_temps=$(echo "$sensors_out" | grep -iE '^(core|cpu)' | grep -oP '[0-9]+\.[0-9]+' | tr '\n' ' ')
-    if [[ -z "$core_temps" ]]; then
+    local total=0
+    local count=0
+    local max_temp=0
+    local hottest_sensor=""
+
+    while IFS=$'\t' read -r name temp; do
+        echo "DEBUG CPU: name='$name', temp='$temp'" >&2
+        [[ -z "$name" || -z "$temp" ]] && continue
+        local current_temp
+        current_temp=$(awk -v x="$temp" 'BEGIN {print x+0}')
+
+        if (( count == 0 )); then
+            max_temp=$current_temp
+            hottest_sensor="$name"
+        elif float_gt "$current_temp" "$max_temp"; then
+            max_temp=$current_temp
+            hottest_sensor="$name"
+        fi
+
+        total=$(awk -v a="$total" -v b="$current_temp" 'BEGIN { printf "%.6f", (a+0)+(b+0) }')
+        ((count++))
+    done < <(echo "$sensors_out" | awk -F: '/(Core|CPU|Package id|Tdie|Tctl)/ {
+            name=$1; gsub(/^[ \t]+|[ \t]+$/, "", name);
+            val=$2;
+            if (match(val, /[-+]?[0-9]+(\.[0-9]+)?/)) {
+                temp = substr(val, RSTART, RLENGTH);
+                gsub(/^[+]/, "", temp);
+                printf "%s\t%s\n", name, temp;
+            }
+        }')
+
+    if (( count == 0 )); then
         local warn_json=$(jq -n --arg item "$item" '{status:"WARN", item:$item, reason:"在 sensors 輸出中找不到 CPU 核心溫度"}')
         set_check_result 4 "$warn_json"
         return
     fi
-    
-    local max_temp
-    max_temp=$(echo "${core_temps}" | tr ' ' '\n' | sort -nr | head -1)
+
     local avg_temp
-    avg_temp=$(echo "${core_temps}" | tr ' ' '\n' | awk '{ total += $1; count++ } END { if (count > 0) printf "%.1f", total/count; else print 0; }')
+    avg_temp=$(awk -v sum="$total" -v cnt="$count" 'BEGIN { if (cnt>0) printf "%.4f", sum/cnt; else print 0 }')
+    local max_temp_display avg_temp_display
+    max_temp_display=$(awk -v v="$max_temp" 'BEGIN { printf "%.1f", v }')
+    avg_temp_display=$(awk -v v="$avg_temp" 'BEGIN { printf "%.1f", v }')
 
     # Read or create baseline
     local baseline_avg=0
@@ -1394,25 +1431,29 @@ check_cpu() {
         fi
     fi
     [[ "$peak_max_temp" == "null" ]] && peak_max_temp=$max_temp
-    
+    local peak_display
+    peak_display=$(awk -v v="$peak_max_temp" 'BEGIN { printf "%.1f", v }')
+
     # Logic
     local status="PASS"
-    local reason="CPU 溫度正常. Max: ${max_temp}°C (${history_days}d Peak: ${peak_max_temp}°C), Avg: ${avg_temp}°C."
+    local reason=""
     local temp_diff
-    temp_diff=$(echo "$avg_temp - $baseline_avg" | bc)
+    temp_diff=$(awk -v avg="$avg_temp" -v base="$baseline_avg" 'BEGIN { printf "%.4f", avg-base }')
 
-    if (( $(echo "$max_temp >= $CPU_TEMP_CRIT" | bc -l) )); then
+    if float_ge "$max_temp" "$CPU_TEMP_CRIT"; then
         status="FAIL"
-        reason="CPU 溫度嚴重過高. Max: ${max_temp}°C (閾值: ${CPU_TEMP_CRIT}°C). ${history_days}d Peak: ${peak_max_temp}°C."
-    elif (( $(echo "$max_temp >= $CPU_TEMP_WARN" | bc -l) )); then
+        reason="CPU 溫度嚴重過高. Max: ${max_temp_display}°C (閾值: ${CPU_TEMP_CRIT}°C). ${history_days}d Peak: ${peak_display}°C."
+    elif float_ge "$max_temp" "$CPU_TEMP_WARN"; then
         status="WARN"
-        reason="CPU 溫度警告. Max: ${max_temp}°C (閾值: ${CPU_TEMP_WARN}°C). ${history_days}d Peak: ${peak_max_temp}°C."
-    elif (( $(echo "$temp_diff >= 15" | bc -l) )); then
+        reason="CPU 溫度警告. Max: ${max_temp_display}°C (閾值: ${CPU_TEMP_WARN}°C). ${history_days}d Peak: ${peak_display}°C."
+    elif float_ge "$temp_diff" 15; then
         status="FAIL"
-        reason="CPU 平均溫度 (${avg_temp}°C) 相比基準 (${baseline_avg}°C) 異常升高 ${temp_diff}°C."
-    elif (( $(echo "$temp_diff >= 10" | bc -l) )); then
+        reason="CPU 平均溫度 (${avg_temp_display}°C) 相比基準 (${baseline_avg}°C) 異常升高 ${temp_diff}°C."
+    elif float_ge "$temp_diff" 10; then
         status="WARN"
-        reason="CPU 平均溫度 (${avg_temp}°C) 相比基準 (${baseline_avg}°C) 升高 ${temp_diff}°C."
+        reason="CPU 平均溫度 (${avg_temp_display}°C) 相比基準 (${baseline_avg}°C) 升高 ${temp_diff}°C."
+    else
+        reason="CPU 溫度正常. Max: ${max_temp_display}°C (${history_days}d Peak: ${peak_display}°C), Avg: ${avg_temp_display}°C."
     fi
 
     # Final JSON
@@ -1738,14 +1779,7 @@ check_env() {
         return
     fi
     
-    local env_sdr_out
-    env_sdr_out=$(echo "$sdr_out" | egrep -i 'temp|inlet|ambient' || true)
-    echo "$env_sdr_out" > "$raw_log_path"
-
-    if [[ -z "$env_sdr_out" ]]; then
-        set_check_result 8 "$(jq -n --arg item "$item" '{status:"WARN", item:$item, reason:"無 Inlet/Ambient 溫度感測器資料"}')"
-        return
-    fi
+    printf '%s\n' "$sdr_out" > "$raw_log_path"
 
     # --- Historical Analysis ---
     local history_days="$LOG_DAYS"
@@ -1763,63 +1797,160 @@ check_env() {
         ' "${historical_files[@]}")
     fi
 
-    local final_status="PASS"
-    local final_reason=""
-    local reason_details=()
-    local metrics_array=()
+    local include_regex='(inlet|ambient|board|mb|bp|pch|scm|psu|system|chassis|backplane|center|centre)'
+    local exclude_regex='(cpu|vr|mem|dim|nvme|ssd|gpu|asic|retimer|ocp|vcore)'
+    local -a primary_sensor_lines=()
+    local -a fallback_sensor_lines=()
 
-    local parsed_sensors
-    parsed_sensors=$(echo "$env_sdr_out" | awk -F'|' '
-    /degrees C/ {
-        sensor_name = $1; gsub(/^[ \t]+|[ \t]+$/, "", sensor_name);
-        current_reading = $5; gsub(/^[ \t]+|[ \t]+| degrees C/, "", current_reading);
-        unc = "na"; uc = "na";
-    }
-    /Upper Non-Critical/ { unc = $2; gsub(/^[ \t]+|[ \t]+$/, "", unc); }
-    /Upper Critical/ { uc = $2; gsub(/^[ \t]+|[ \t]+$/, "", uc);
-        print sensor_name "|" current_reading "|" unc "|" uc;
-        sensor_name=""; current_reading=""; unc="na"; uc="na";
-    }')
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" != *"|"* ]] && continue
+        line=${line%$'\r'}
+        IFS='|' read -r raw_name _ raw_status _ raw_value _ <<< "$line"
+        local name value_field temp_val name_lower
+        name=$(printf '%s' "${raw_name:-}" | trim)
+        [[ -z "$name" ]] && continue
+        value_field=$(printf '%s' "${raw_value:-}" | trim)
+        value_field=${value_field%$'\r'}
+        if [[ ! "$value_field" =~ ^([+-]?[0-9]+(\.[0-9]+)?) ]]; then
+            continue
+        fi
+        temp_val="${BASH_REMATCH[1]#+}"
+        name_lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+        if [[ "$name_lower" =~ $exclude_regex ]]; then
+            continue
+        fi
+        local entry="${name}|${temp_val}|35|40"
+        if [[ "$name_lower" =~ $include_regex ]]; then
+            primary_sensor_lines+=("$entry")
+        else
+            fallback_sensor_lines+=("$entry")
+        fi
+    done <<< "$sdr_out"
 
-    if [[ -z "$parsed_sensors" ]]; then
-         parsed_sensors=$(echo "$env_sdr_out" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); val=$2; sub(/ .*$/, "", val); if (val ~ /^[0-9]+$/) print $1 "|" val "|35|40"}')
+    local -a sensor_lines=()
+    local used_fallback=0
+    if (( ${#primary_sensor_lines[@]} > 0 )); then
+        sensor_lines=("${primary_sensor_lines[@]}")
+    elif (( ${#fallback_sensor_lines[@]} > 0 )); then
+        sensor_lines=("${fallback_sensor_lines[@]}")
+        used_fallback=1
+    fi
+    echo "DEBUG ENV: sensor_lines count=${#sensor_lines[@]}" >&2
+    if ((${#sensor_lines[@]} > 0)); then
+      echo "DEBUG ENV: first line='${sensor_lines[0]}'" >&2
     fi
 
-    while IFS='|' read -r name reading unc uc; do
+    if (( ${#sensor_lines[@]} == 0 )); then
+        local warn_json
+        warn_json=$(jq -n --arg item "$item" --arg raw "$raw_log_path" '{status:"WARN", item:$item, reason:"無法解析環境溫度感測器資料", evidence:{raw_sdr_log:$raw}}')
+        set_check_result 8 "$warn_json"
+        return
+    fi
+
+    local final_status="PASS"
+    local final_reason=""
+    local -a reason_details=()
+    local -a sensor_summary=()
+    local metrics_array=()
+    local overall_warn=""
+    local overall_crit=""
+
+    for line in "${sensor_lines[@]}"; do
+        IFS='|' read -r name reading warn_raw crit_raw <<< "$line"
         [[ -z "$name" || -z "$reading" ]] && continue
 
-        local sensor_status="PASS"
-        local warn_th=${unc:-35}
-        local crit_th=${uc:-40}
+        local reading_val
+        reading_val=$(awk -v v="$reading" 'BEGIN { if (v+0==v) printf "%.2f", v; else print "" }')
+        [[ -z "$reading_val" ]] && continue
 
-        if (( $(echo "$reading >= $crit_th" | bc -l) )); then
-            sensor_status="FAIL"; final_status="FAIL"; reason_details+=("${name}: ${reading}°C >= ${crit_th}°C")
-        elif (( $(echo "$reading >= $warn_th" | bc -l) )); then
-            sensor_status="WARN"; [[ "$final_status" == "PASS" ]] && final_status="WARN"; reason_details+=("${name}: ${reading}°C >= ${warn_th}°C")
+        local warn_val="" crit_val=""
+        [[ "$warn_raw" =~ ^[0-9]+(\.[0-9]+)?$ ]] && warn_val="$warn_raw"
+        [[ "$crit_raw" =~ ^[0-9]+(\.[0-9]+)?$ ]] && crit_val="$crit_raw"
+
+        sensor_summary+=( "$(printf '%s:%s°C' "$name" "$(awk -v v="$reading_val" 'BEGIN{printf "%.1f", v}')")" )
+
+        if [[ -n "$warn_val" ]]; then
+            if [[ -z "$overall_warn" ]] || awk -v a="$warn_val" -v b="$overall_warn" 'BEGIN { exit (a < b) ? 0 : 1 }'; then
+                overall_warn="$warn_val"
+            fi
+        fi
+        if [[ -n "$crit_val" ]]; then
+            if [[ -z "$overall_crit" ]] || awk -v a="$crit_val" -v b="$overall_crit" 'BEGIN { exit (a < b) ? 0 : 1 }'; then
+                overall_crit="$crit_val"
+            fi
+        fi
+
+        local sensor_status="PASS"
+        if [[ -n "$crit_val" ]] && float_ge "$reading_val" "$crit_val"; then
+            sensor_status="FAIL"
+            final_status="FAIL"
+            reason_details+=( "$(printf '%s: %.1f°C >= %.1f°C' "$name" "$reading_val" "$crit_val")" )
+        elif [[ -n "$warn_val" ]] && float_ge "$reading_val" "$warn_val"; then
+            sensor_status="WARN"
+            [[ "$final_status" != "FAIL" ]] && final_status="WARN"
+            reason_details+=( "$(printf '%s: %.1f°C >= %.1f°C' "$name" "$reading_val" "$warn_val")" )
         fi
 
         local sensor_history
-        sensor_history=$(echo "$historical_stats_json" | jq -c --arg name "$name" '.[$name] // null')
+        sensor_history=$(echo "$historical_stats_json" | jq -c --arg name "$name" '.[$name] // null' 2>/dev/null)
+        [[ -z "$sensor_history" ]] && sensor_history="null"
 
-        metrics_array+=( $(jq -n --arg name "$name" --arg status "$sensor_status" --argjson val "$reading" --arg unit "C" --argjson history "$sensor_history" \
-            '{name:$name, status:$status, value:$val, unit:$unit, historical_stats:$history}') )
-    done <<< "$parsed_sensors"
+        metrics_array+=( "$(jq -n \
+            --arg name "$name" \
+            --arg status "$sensor_status" \
+            --arg value "$reading_val" \
+            --arg unit "C" \
+            --arg warn "$warn_val" \
+            --arg crit "$crit_val" \
+            --argjson history "$sensor_history" \
+            '{name:$name, status:$status, value:($value|tonumber), unit:$unit,
+              warn_threshold:(if $warn=="" then null else ($warn|tonumber) end),
+              crit_threshold:(if $crit=="" then null else ($crit|tonumber) end),
+              historical_stats:$history}')" )
+    done
 
-    if [[ "$final_status" != "PASS" ]]; then
-        final_reason="環境溫度異常: $(IFS=,; echo "${reason_details[*]}")"
-    else
-        local summary
-        summary=$(jq -n "[$(IFS=,; echo "${metrics_array[*]}")]" | jq -r '.[] | .name + ":" + (.value|tostring) + "°C"' | paste -sd ", ")
-        final_reason="環境溫度正常. ${summary}"
+    if (( ${#metrics_array[@]} == 0 )); then
+        local warn_json
+        warn_json=$(jq -n --arg item "$item" --arg raw "$raw_log_path" '{status:"WARN", item:$item, reason:"無法解析環境溫度感測器資料", evidence:{raw_sdr_log:$raw}}')
+        set_check_result 8 "$warn_json"
+        return
     fi
+
+    if [[ "$final_status" == "PASS" ]]; then
+        local warn_disp="-" crit_disp="-"
+        [[ -n "$overall_warn" ]] && warn_disp=$(awk -v v="$overall_warn" 'BEGIN{printf "%.1f", v}')
+        [[ -n "$overall_crit" ]] && crit_disp=$(awk -v v="$overall_crit" 'BEGIN{printf "%.1f", v}')
+        local summary_line=""
+        if (( ${#sensor_summary[@]} > 0 )); then
+            summary_line=$(IFS=', '; echo "${sensor_summary[*]}")
+        fi
+        final_reason="環境溫度正常 (警戒 ${warn_disp}°C / 臨界 ${crit_disp}°C)。${summary_line}"
+    else
+        local detail_line=$(IFS='; '; echo "${reason_details[*]}")
+        final_reason="環境溫度異常: ${detail_line}"
+    fi
+    if (( used_fallback )); then
+        final_reason+="（以後備感測器分類）"
+    fi
+
+    local metrics_json
+    metrics_json=$(printf '%s\n' "${metrics_array[@]}" | jq -s '.')
+
+    local thresholds_json
+    thresholds_json=$(jq -n \
+        --arg warn "$overall_warn" \
+        --arg crit "$overall_crit" \
+        '{observed_warn_celsius:(if $warn=="" then null else ($warn|tonumber) end),
+          observed_crit_celsius:(if $crit=="" then null else ($crit|tonumber) end),
+          policy:"sdr"}')
 
     local final_json
     final_json=$(jq -n \
         --arg status "$final_status" \
         --arg item "$item" \
         --arg reason "$final_reason" \
-        --argjson metrics "[$(IFS=,; echo "${metrics_array[*]}")]" \
-        --argjson thresholds "$(jq -n '{default_warn_celsius:35, default_crit_celsius:40, note:"Using hardware thresholds from SDR if available"}')" \
+        --argjson metrics "$metrics_json" \
+        --argjson thresholds "$thresholds_json" \
         --argjson evidence "$(jq -n --arg raw "$raw_log_path" '{raw_sdr_log:$raw}')" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
 
@@ -2617,4 +2748,3 @@ fi
 rm -rf "$RAID_TMP_DIR"
 
 exit $EXIT_CODE
-
