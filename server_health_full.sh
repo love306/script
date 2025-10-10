@@ -1318,18 +1318,16 @@ check_memory() {
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       local lower=${line,,}
-      local counted=0
+      # Categorize errors. Start with the most severe.
       if [[ $lower =~ (uncorrect|non[-\ ]recoverable|fatal|machine\ check|mce|hardware\ error) ]]; then
         ((uncorrected++))
-        counted=1
+      elif [[ $lower =~ (corrected|correctable|recover(ed|able)|soft\ error) ]]; then
+        ((corrected++))
+      elif [[ $lower =~ (error|fail|fault) ]]; then
+        # Catch generic errors that weren't classified as corrected/uncorrected.
+        # This avoids flagging informational messages like "EDAC MC: Ver: 3.0.0"
+        ((other++))
       fi
-      if (( counted == 0 )); then
-        if [[ $lower =~ (corrected|correctable|recover(ed|able)|soft\ error) ]]; then
-          ((corrected++))
-          counted=1
-        fi
-      fi
-      (( counted == 0 )) && ((other++))
     done <<< "$log_output"
   fi
 
