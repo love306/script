@@ -327,7 +327,7 @@ declare -A ALL_CHECK_RESULTS
 set_check_result() {
     local id="$1"
     local json_data="$2"
-    
+
     # 將完整的 JSON 結果存入全域陣列
     ALL_CHECK_RESULTS["$id"]="$json_data"
 
@@ -340,6 +340,48 @@ set_check_result() {
 
     # 同時更新舊的 json_items (最終會被 build_master_json 取代)
     add_json_item "$id" "$status" "$reason"
+}
+
+# ----------------- Judgement Utilities (v2.3 新增) -----------------
+# 統一建構 judgement JSON
+# 參數:
+#   $1: criteria (string) - 判斷邏輯的人類可讀描述
+#   $2: pass_rules (JSON array string) - PASS 條件列表
+#   $3: warn_rules (JSON array string) - WARN 條件列表
+#   $4: fail_rules (JSON array string) - FAIL 條件列表
+#   $5: checks_json (JSON array string) - 實際檢查結果列表
+#   $6: th_json (JSON object string) - 本次生效的閾值
+build_judgement() {
+  local criteria="$1"; shift
+  local pass_rules="$1"; shift
+  local warn_rules="$1"; shift
+  local fail_rules="$1"; shift
+  local checks_json="$1"; shift
+  local th_json="$1"; shift
+
+  jq -n \
+    --arg criteria "$criteria" \
+    --argjson policy "$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+                        '{pass:$pass, warn:$warn, fail:$fail}')" \
+    --argjson checks "$checks_json" \
+    --argjson thresholds "$th_json" \
+    '{criteria:$criteria, policy:$policy, checks:$checks, thresholds:$thresholds}'
+}
+
+# 包裝函式：將 judgement 併入 set_check_result 的 JSON
+# 參數:
+#   $1: id (檢查項目編號)
+#   $2: base_json (原有的 status/reason/metrics/evidence/tips JSON)
+#   $3: jdg_json (judgement JSON)
+set_check_result_with_jdg() {
+  local id="$1" ; shift
+  local base_json="$1" ; shift
+  local jdg_json="$1"  ; shift
+
+  # 將 judgement 併入
+  local merged
+  merged=$(jq -c --argjson j "$jdg_json" '. + {judgement:$j}' <<< "$base_json")
+  set_check_result "$id" "$merged"
 }
 
 # --- [LEGACY] 舊的結果儲存陣列 (逐步淘汰) ---
@@ -365,6 +407,75 @@ set_status() {
   RESULT_STATUS["$id"]="$st"
   RESULT_NOTE["$id"]="$note"
   add_json_item "$id" "$st" "$note"
+
+  # --- Auto-generate judgement for legacy set_status calls (v2.3) ---
+  # 為舊架構項目自動生成基礎 judgement
+  local item_name="${ITEM_NAME[$id]:-Unknown}"
+
+  # 基礎 criteria 根據 status 自動生成
+  local criteria="Legacy check: $item_name"
+
+  # Policy rules 根據 status 類型
+  local pass_rules='["項目檢查通過"]'
+  local warn_rules='["項目檢查發現警告"]'
+  local fail_rules='["項目檢查失敗"]'
+  local skip_rules='["項目檢查跳過"]'
+  local info_rules='["項目提供資訊"]'
+
+  # Checks - 記錄當前狀態
+  local checks_json
+  checks_json=$(jq -n --arg status "$st" --arg reason "$note" \
+    '[{"name":"Status","ok":($status=="PASS" or $status=="INFO" or $status=="SKIP"),"value":$status},
+      {"name":"Reason","ok":true,"value":$reason}]')
+
+  # Thresholds - 舊架構項目通常沒有數值閾值
+  local th_json='{}'
+
+  # 根據 status 選擇合適的 policy
+  local policy_json
+  case "$st" in
+    PASS)
+      policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+        '{pass:$pass, warn:$warn, fail:$fail}')
+      ;;
+    WARN)
+      policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+        '{pass:$pass, warn:$warn, fail:$fail}')
+      ;;
+    FAIL)
+      policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+        '{pass:$pass, warn:$warn, fail:$fail}')
+      ;;
+    SKIP)
+      policy_json=$(jq -n --argjson skip "$skip_rules" '{skip:$skip}')
+      ;;
+    INFO)
+      policy_json=$(jq -n --argjson info "$info_rules" '{info:$info}')
+      ;;
+    *)
+      policy_json='{}'
+      ;;
+  esac
+
+  # 組合 judgement
+  local jdg_json
+  jdg_json=$(jq -n \
+    --arg criteria "$criteria" \
+    --argjson policy "$policy_json" \
+    --argjson checks "$checks_json" \
+    --argjson thresholds "$th_json" \
+    '{criteria:$criteria, policy:$policy, checks:$checks, thresholds:$thresholds}')
+
+  # 生成完整的 JSON 結果並同步到 ALL_CHECK_RESULTS
+  local full_json
+  full_json=$(jq -n \
+    --arg status "$st" \
+    --arg item "$item_name" \
+    --arg reason "$note" \
+    --argjson judgement "$jdg_json" \
+    '{status:$status, item:$item, reason:$reason, judgement:$judgement}')
+
+  ALL_CHECK_RESULTS["$id"]="$full_json"
 }
 
 need_cmd() {
@@ -699,12 +810,20 @@ io_status_from_log(){
   (( $(awk -v r="$r_mb" -v min="$IO_READ_MIN" 'BEGIN{print (r>=min)?1:0}') )) && r_ok=1
   (( $(awk -v w="$w_mb" -v min="$IO_WRITE_MIN" 'BEGIN{print (w>=min)?1:0}') )) && w_ok=1
 
-  if (( r_ok && w_ok )); then
+  # 將空值正規化為 0，避免算術解析錯誤
+  r_ok="${r_ok:-0}"
+  w_ok="${w_ok:-0}"
+
+  if [[ "$r_ok" == "1" && "$w_ok" == "1" ]]; then
     echo "PASS|Read=${r_mb}MB/s, Write=${w_mb}MB/s"
   else
-    local reason=""
-    (( r_ok==0 )) && reason+="Read=${r_mb}MB/s(<${IO_READ_MIN});"
-    (( w_ok==0 )) && reason+="Write=${w_mb}MB/s(<${IO_WRITE_MIN});"
+    local reason_parts=()
+    [[ "$r_ok" != "1" ]] && reason_parts+=("Read=${r_mb}MB/s(<${IO_READ_MIN})")
+    [[ "$w_ok" != "1" ]] && reason_parts+=("Write=${w_mb}MB/s(<${IO_WRITE_MIN})")
+    local reason
+    IFS=';'
+    reason="${reason_parts[*]}"
+    IFS=$' \t\n'
     echo "WARN|$reason"
   fi
 }
@@ -867,8 +986,32 @@ check_psu() {
         --arg reason "$final_reason" \
         '{status: $status, item: $item, metrics: $metrics, evidence: $evidence, reason: $reason}')
 
+    # --- Build judgement ---
+    local th_json
+    th_json=$(jq -n --arg sel_days "$SEL_DAYS" '{SEL_DAYS: ($sel_days|tonumber)}')
+
+    local checks_json
+    checks_json=$(jq -n \
+      --arg chassis_rc "$( [[ $chassis_rc -eq 0 ]] && echo 0 || echo 1 )" \
+      --arg psu_fail_count "$psu_fail_count" \
+      --arg sel_count "$sel_count" \
+      --arg chassis_log "$chassis_log" \
+      --arg sel_log "$sel_log" \
+      '[{"name":"ipmitool chassis status rc==0","ok":($chassis_rc|tonumber==0),"value":("rc="+$chassis_rc)},
+        {"name":"chassis 報告 PSU 故障數=0","ok":($psu_fail_count|tonumber==0),"value":("count="+$psu_fail_count)},
+        {"name":"SEL 關聯事件=0（視窗內）","ok":($sel_count|tonumber==0),"value":("count="+$sel_count)},
+        {"name":"evidence","ok":true,"value":("chassis="+$chassis_log+", sel="+$sel_log)}]')
+
+    local pass_rules='["chassis rc==0 且 PSU 故障數=0 且 SEL 電源相關事件=0"]'
+    local warn_rules='["chassis rc==0 且 PSU 故障數=0 但 SEL 有電源相關事件"]'
+    local fail_rules='["chassis rc!=0 或 PSU 故障數>0"]'
+    local criteria="PSU 正常：IPMI 正常、chassis 無 PSU failure、SEL 視窗內無電源/電壓故障事件"
+
+    local jdg_json
+    jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
     echo "$final_json" > "$metrics_path"
-    set_check_result 1 "$final_json"
+    set_check_result_with_jdg 1 "$final_json" "$jdg_json"
 }
 
 # ----------------- 2 Disks -----------------
@@ -1243,7 +1386,37 @@ check_disks() {
         --argjson evidence "$evidence_json" \
         '{status: $status, item: $item, metrics: $metrics, reason: $reason, evidence: $evidence}')
 
-    set_check_result 2 "$final_json"
+    # --- Build judgement ---
+    local vd_failed=$(echo "$RAID_SUMMARY_JSON" | jq -r '.vd_failed // 0' 2>/dev/null)
+    local vd_degraded=$(echo "$RAID_SUMMARY_JSON" | jq -r '.vd_degraded // 0' 2>/dev/null)
+    local pd_failed=$(echo "$RAID_SUMMARY_JSON" | jq -r '.pd_failed // 0' 2>/dev/null)
+    local rebuild_present=$(echo "$RAID_SUMMARY_JSON" | jq -r '.rebuild_present // false' 2>/dev/null)
+
+    local th_json='{}'  # Disks 項目無固定數值閾值
+
+    local checks_json
+    checks_json=$(jq -n \
+      --arg raid_status "$raid_status" \
+      --arg vd_failed "$vd_failed" \
+      --arg vd_degraded "$vd_degraded" \
+      --arg pd_failed "$pd_failed" \
+      --arg rebuild "$rebuild_present" \
+      --arg mdstat_status "$mdstat_status" \
+      '[{"name":"硬體 RAID VD 故障=0","ok":($vd_failed|tonumber==0),"value":("vd_failed="+$vd_failed)},
+        {"name":"硬體 RAID VD 降級=0","ok":($vd_degraded|tonumber==0),"value":("vd_degraded="+$vd_degraded)},
+        {"name":"硬體 RAID PD 故障=0","ok":($pd_failed|tonumber==0),"value":("pd_failed="+$pd_failed)},
+        {"name":"無 Rebuild/Init 進行中","ok":($rebuild!="true"),"value":("rebuild="+$rebuild)},
+        {"name":"軟體 RAID 狀態","ok":($mdstat_status!="FAIL"),"value":("mdstat="+$mdstat_status)}]')
+
+    local pass_rules='["VD/PD 故障=0 且 VD 降級=0 且無 Rebuild 且 SMART 無異常"]'
+    local warn_rules='["Rebuild/Init 進行中 或 SMART 有 pre-fail/reallocated sectors 或軟體 RAID resyncing"]'
+    local fail_rules='["VD 故障>0 或 PD 故障>0 或 VD 降級>0 或軟體 RAID degraded 或 SMART FAILED"]'
+    local criteria="磁碟健康：硬體/軟體 RAID 無故障/降級、無 rebuild、SMART 屬性正常"
+
+    local jdg_json
+    jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
+    set_check_result_with_jdg 2 "$final_json" "$jdg_json"
 }
 
 # ----------------- 3 Memory / ECC -----------------
@@ -1370,7 +1543,30 @@ check_memory() {
     --argjson evidence "$evidence_json" \
     '{status:$status,item:$item,reason:$reason,metrics:$metrics,evidence:$evidence}')
 
-  set_check_result 3 "$result_json"
+  # --- Build judgement ---
+  local th_json
+  th_json=$(jq -n --arg log_days "$LOG_DAYS" '{LOG_DAYS: ($log_days|tonumber)}')
+
+  local checks_json
+  checks_json=$(jq -n \
+    --arg corrected "$corrected" \
+    --arg uncorrected "$uncorrected" \
+    --arg other "$other" \
+    --arg log_source "$log_source" \
+    '[{"name":"不可修正錯誤=0","ok":($uncorrected|tonumber==0),"value":("uncorrected="+$uncorrected)},
+      {"name":"可修正錯誤=0","ok":($corrected|tonumber==0),"value":("corrected="+$corrected)},
+      {"name":"其他相關訊息=0","ok":($other|tonumber==0),"value":("other="+$other)},
+      {"name":"Log 來源","ok":true,"value":$log_source}]')
+
+  local pass_rules='["不可修正錯誤=0 且 可修正錯誤=0 且其他相關訊息=0"]'
+  local warn_rules='["可修正錯誤>0 或 其他相關訊息>0 (但不可修正錯誤=0)"]'
+  local fail_rules='["不可修正錯誤>0"]'
+  local criteria="記憶體健康：LOG_DAYS 視窗內無不可修正 ECC/MCE 錯誤、可修正錯誤需為 0"
+
+  local jdg_json
+  jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
+  set_check_result_with_jdg 3 "$result_json" "$jdg_json"
 }
 
 # ----------------- 4 CPU -----------------
@@ -1531,8 +1727,29 @@ check_cpu() {
         --argjson evidence "$evidence_json" \
         '{status: $status, item: $item, reason: $reason, metrics: $metrics, thresholds: $thresholds, historical_stats: $history, evidence: $evidence}')
 
+    # --- Build judgement ---
+    local th_json
+    th_json=$(jq -n --arg warn "$CPU_TEMP_WARN" --arg crit "$CPU_TEMP_CRIT" \
+      '{CPU_TEMP_WARN: ($warn|tonumber), CPU_TEMP_CRIT: ($crit|tonumber)}')
+
+    local checks_json
+    checks_json=$(jq -n \
+      --arg max_temp "$max_temp" \
+      --arg warn "$CPU_TEMP_WARN" \
+      --arg crit "$CPU_TEMP_CRIT" \
+      '[{"name":"Max Temp <= WARN","ok":(($max_temp|tonumber) <= ($warn|tonumber)),"value":("max="+$max_temp+"°C")},
+        {"name":"Max Temp <= CRIT","ok":(($max_temp|tonumber) <= ($crit|tonumber)),"value":("max="+$max_temp+"°C")}]')
+
+    local pass_rules='["最大 CPU 溫度 <= WARN"]'
+    local warn_rules='["WARN < 最大 CPU 溫度 <= CRIT"]'
+    local fail_rules='["最大 CPU 溫度 > CRIT"]'
+    local criteria="CPU 溫度：以代表性傳感器最大值比較 WARN/CRIT 門檻"
+
+    local jdg_json
+    jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
     echo "$final_json" > "$metrics_path"
-    set_check_result 4 "$final_json"
+    set_check_result_with_jdg 4 "$final_json" "$jdg_json"
 }
 
 # ----------------- 5 NIC -----------------
@@ -1750,7 +1967,33 @@ check_nic() {
         --argjson evidence "$evidence_obj" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, evidence:$evidence}')
 
-    set_check_result 5 "$final_json"
+    # --- Build judgement ---
+    local th_json
+    th_json=$(jq -n \
+      --arg min_delta "$NIC_WARN_MIN_DELTA" \
+      --arg min_pct "$NIC_WARN_MIN_PCT" \
+      --arg min_rx_drop_rate "$NIC_WARN_MIN_RX_DROP_RATE" \
+      '{NIC_WARN_MIN_DELTA: ($min_delta|tonumber), NIC_WARN_MIN_PCT: ($min_pct|tonumber), NIC_WARN_MIN_RX_DROP_RATE: ($min_rx_drop_rate|tonumber)}')
+
+    local checks_json='[]'
+    if [[ ${#reason_details[@]} -gt 0 ]]; then
+        # 有檢測到問題，將各 NIC 的狀況列入 checks
+        for detail in "${reason_details[@]}"; do
+            checks_json=$(echo "$checks_json" | jq --arg d "$detail" '. + [{"name":"NIC Issue","ok":false,"value":$d}]')
+        done
+    else
+        checks_json='[{"name":"所有 NIC 計數器穩定","ok":true,"value":"no delta detected"}]'
+    fi
+
+    local pass_rules='["所有 NIC 計數器無顯著增量（rx_dropped/tx_dropped/rx_errors/tx_errors 等）"]'
+    local warn_rules='["任一 NIC 的錯誤/丟包計數器有增量，但未達嚴重程度"]'
+    local fail_rules='["任一 NIC 介面 down 或嚴重錯誤率超標"]'
+    local criteria="NIC 健康：增量錯誤/丟包在視窗內需 < 閾值（MIN_DELTA/MIN_PCT/MIN_RX_DROP_RATE）"
+
+    local jdg_json
+    jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
+    set_check_result_with_jdg 5 "$final_json" "$jdg_json"
 }
 
 # ----------------- 6 GPU -----------------
@@ -1913,9 +2156,33 @@ check_fans() {
         --argjson thresholds "{\"low_rpm_th\": ${FAN_RPM_TH}, \"deviation_warn_pct\": 20, \"deviation_crit_pct\": 40}" \
         --argjson evidence "{\"sensors_log\": \"${raw_sensors_log}\", \"ipmi_sdr_log\": \"${raw_ipmi_sdr_log}\", \"baseline_file\": \"${baseline_path}\"}" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
-    
+
+    # --- Build judgement ---
+    local th_json
+    th_json=$(jq -n --arg rpm_th "$FAN_RPM_TH" \
+      '{FAN_RPM_TH: ($rpm_th|tonumber), DEVIATION_WARN_PCT: 20, DEVIATION_CRIT_PCT: 40}')
+
+    local checks_json
+    checks_json=$(jq -n \
+      --arg low_count "$low_rpm_count" \
+      --arg dev_crit_count "$deviation_crit_count" \
+      --arg dev_warn_count "$deviation_warn_count" \
+      --arg fan_count "${#metrics_json_array[@]}" \
+      '[{"name":"低轉速風扇數=0","ok":($low_count|tonumber==0),"value":("low_rpm_count="+$low_count)},
+        {"name":"嚴重偏差風扇數=0","ok":($dev_crit_count|tonumber==0),"value":("deviation_crit="+$dev_crit_count)},
+        {"name":"警告偏差風扇數=0","ok":($dev_warn_count|tonumber==0),"value":("deviation_warn="+$dev_warn_count)},
+        {"name":"檢測到的風扇數","ok":($fan_count|tonumber>0),"value":("fans="+$fan_count)}]')
+
+    local pass_rules='["所有風扇轉速 >= FAN_RPM_TH 且偏差 <= 20%"]'
+    local warn_rules='["任一風扇轉速 < FAN_RPM_TH 或 20% < 偏差 <= 40%"]'
+    local fail_rules='["任一風扇偏差 > 40%"]'
+    local criteria="風扇健康：轉速 >= 閾值且相對 baseline 偏差在合理範圍"
+
+    local jdg_json
+    jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
     echo "$final_json" > "$metrics_path"
-    set_check_result 7 "$final_json"
+    set_check_result_with_jdg 7 "$final_json" "$jdg_json"
 }
 
 check_env() {
@@ -2119,8 +2386,33 @@ check_env() {
         --argjson evidence "$(jq -n --arg raw "$raw_log_path" '{raw_sdr_log:$raw}')" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
 
+    # --- Build judgement ---
+    local th_json
+    th_json=$(jq -n \
+      --arg warn "$overall_warn" \
+      --arg crit "$overall_crit" \
+      '{ENV_WARN_CELSIUS: (if $warn=="" then null else ($warn|tonumber) end),
+        ENV_CRIT_CELSIUS: (if $crit=="" then null else ($crit|tonumber) end)}')
+
+    local max_temp_val=$(echo "$metrics_json" | jq -r 'map(.value) | max // 0')
+    local checks_json
+    checks_json=$(jq -n \
+      --arg max_temp "$max_temp_val" \
+      --arg warn "$overall_warn" \
+      --arg crit "$overall_crit" \
+      '[{"name":"Max Temp <= WARN","ok":(if $warn=="" then true else (($max_temp|tonumber) <= ($warn|tonumber)) end),"value":("max="+$max_temp+"°C")},
+        {"name":"Max Temp <= CRIT","ok":(if $crit=="" then true else (($max_temp|tonumber) <= ($crit|tonumber)) end),"value":("max="+$max_temp+"°C")}]')
+
+    local pass_rules='["最大環境溫度 <= WARN"]'
+    local warn_rules='["WARN < 最大環境溫度 <= CRIT"]'
+    local fail_rules='["最大環境溫度 > CRIT"]'
+    local criteria="環境溫度：以代表性傳感器（Inlet/Ambient）最大值比較 IPMI SDR WARN/CRIT 門檻"
+
+    local jdg_json
+    jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
     echo "$final_json" > "$metrics_path"
-    set_check_result 8 "$final_json"
+    set_check_result_with_jdg 8 "$final_json" "$jdg_json"
 }
 
 # ----------------- 9 Power / UPS -----------------
@@ -2454,7 +2746,29 @@ check_bmc() {
   local final_json
   final_json=$(jq -n --arg item "$item" --arg status "$final_status" --arg reason "$final_reason" --argjson evidence "$evidence" \
     '{status:$status, item:$item, reason:$reason, evidence:$evidence}')
-  set_check_result 12 "$final_json"
+
+  # --- Build judgement ---
+  local th_json
+  th_json=$(jq -n --arg sel_days "$SEL_DAYS" '{SEL_DAYS: ($sel_days|tonumber)}')
+
+  local checks_json
+  checks_json=$(jq -n \
+    --arg crit "$SEL_CRIT" \
+    --arg warn "$SEL_WARN" \
+    --arg info "$SEL_INFO" \
+    '[{"name":"SEL CRIT 事件=0","ok":($crit|tonumber==0),"value":("crit="+$crit)},
+      {"name":"SEL WARN 事件=0","ok":($warn|tonumber==0),"value":("warn="+$warn)},
+      {"name":"SEL INFO 事件計數","ok":true,"value":("info="+$info)}]')
+
+  local pass_rules='["SEL_DAYS 視窗內 CRIT=0 且 WARN=0"]'
+  local warn_rules='["SEL WARN>0 但 CRIT=0"]'
+  local fail_rules='["SEL CRIT>0"]'
+  local criteria="BMC/SEL 健康：SEL 事件日誌視窗內無 CRIT/WARN 級別事件"
+
+  local jdg_json
+  jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
+  set_check_result_with_jdg 12 "$final_json" "$jdg_json"
 }
 
 # ----------------- 13 Logs -----------------
@@ -2600,6 +2914,29 @@ append_consolidated_report_to_md() {
 
       echo "### ${status_icon} ${ITEM_NAME[$i]} - $status"
       echo "> ${reason}"
+
+      # Add judgement information (v2.3)
+      local judgement_json
+      judgement_json=$(echo "${ALL_CHECK_RESULTS[$i]:-}" | jq -c .judgement 2>/dev/null)
+      if [[ -n "$judgement_json" && "$judgement_json" != "null" && "$judgement_json" != "{}" ]]; then
+        echo ""
+        echo "**Judgement**:"
+        local criteria=$(echo "$judgement_json" | jq -r '.criteria // ""')
+        if [[ -n "$criteria" && "$criteria" != "null" ]]; then
+          echo "- **Criteria**: $criteria"
+        fi
+        local thresholds=$(echo "$judgement_json" | jq -r '.thresholds // {} | to_entries | map("  - \(.key): \(.value)") | join("\n")')
+        if [[ -n "$thresholds" && "$thresholds" != "" ]]; then
+          echo "- **Thresholds**:"
+          echo "$thresholds"
+        fi
+        local checks=$(echo "$judgement_json" | jq -r '.checks // [] | map("  - \(.name): \(.value) [\(if .ok then "✓" else "✗" end)]") | join("\n")')
+        if [[ -n "$checks" ]]; then
+          echo "- **Checks**:"
+          echo "$checks"
+        fi
+      fi
+
       if [[ -n "$tips" ]]; then
         echo ""
         echo "**Suggested Commands**:"
@@ -2699,6 +3036,39 @@ consolidate_report() {
         echo -e "     ${C_BLUE}LOGS:${C_RESET}"
         echo "$evidence_json" | jq -r 'to_entries[] | "       \(.key): \(.value)"'
     fi
+
+    # Print Judgement information if it exists (v2.3 新增)
+    local judgement_json
+    judgement_json=$(echo "${ALL_CHECK_RESULTS[$i]:-}" | jq -c .judgement 2>/dev/null)
+    if [[ -n "$judgement_json" && "$judgement_json" != "null" && "$judgement_json" != "{}" ]]; then
+        echo -e "     ${C_BLUE}JUDGEMENT:${C_RESET}"
+
+        # 顯示 criteria
+        local criteria=$(echo "$judgement_json" | jq -r '.criteria // ""')
+        if [[ -n "$criteria" && "$criteria" != "null" ]]; then
+            echo -e "       ${C_BOLD}Criteria:${C_RESET} $criteria"
+        fi
+
+        # 顯示 checks 摘要（只顯示失敗的或關鍵的）
+        local checks_summary=$(echo "$judgement_json" | jq -r '
+          .checks // [] |
+          map(select(.ok == false or .name == "Status")) |
+          if length > 0 then
+            map("  - \(.name): \(.value) [\(if .ok then "✓" else "✗" end)]") | join("\n")
+          else
+            "  All checks passed"
+          end')
+        if [[ -n "$checks_summary" && "$checks_summary" != "null" ]]; then
+            echo -e "       ${C_BOLD}Key Checks:${C_RESET}"
+            echo "$checks_summary" | sed 's/^/       /'
+        fi
+
+        # 顯示 thresholds（如果有）
+        local thresholds=$(echo "$judgement_json" | jq -r '.thresholds // {} | to_entries | map("\(.key)=\(.value)") | join(", ")')
+        if [[ -n "$thresholds" && "$thresholds" != "" ]]; then
+            echo -e "       ${C_BOLD}Thresholds:${C_RESET} $thresholds"
+        fi
+    fi
   done
 
   # 6. Append to Markdown file
@@ -2791,21 +3161,39 @@ build_master_json() {
   # Loop through each check item and generate its JSON object using jq
   for i in $(seq 1 15); do
     local id="$i"
-    local status="${FINAL_STATUS[$i]:-NA}"
-    local original_note="${RESULT_NOTE[$i]:-}"
-    local final_reason="${FINAL_REASON[$i]:-}"
-    local tips_str="${FINAL_TIPS_MAP[$i]:-}"
 
-    # Use jq to safely create the JSON object for the current item.
-    # This handles all escaping and ensures the 'tips' field is a proper JSON array of strings.
-    jq -n \
-      --argjson id "$id" \
-      --arg status "$status" \
-      --arg note "$original_note" \
-      --arg reason "$final_reason" \
-      --arg tips "$tips_str" \
-      '{id:$id, status:$status, note:$note, reason:$reason, tips:($tips | split("\n") | map(select(. != "")))}' >> "$tmp_items"
-    
+    # 先試著用 ALL_CHECK_RESULTS[i] 作為「完整新制 JSON」來源
+    local item_json="${ALL_CHECK_RESULTS[$i]:-}"
+    local ok=0
+    if [[ -n "$item_json" ]] && jq -e . >/dev/null 2>&1 <<<"$item_json"; then
+      ok=1
+    fi
+
+    if (( ok )); then
+      # 以新制 JSON 為基礎，補上舊欄位 note/reason/tips（仍以新制為準）
+      local tips_str="${FINAL_TIPS_MAP[$i]:-}"
+      jq -c --arg tips "$tips_str" '
+        . as $it
+        | $it + {
+            tips: ($tips | split("\n") | map(select(. != "")))
+          }
+      ' <<< "$item_json" >> "$tmp_items"
+    else
+      # 回退：用 FINAL_STATUS/NOTE/REASON + TIPS 生出舊制 JSON（沒有 judgement）
+      local status="${FINAL_STATUS[$i]:-NA}"
+      local original_note="${RESULT_NOTE[$i]:-}"
+      local final_reason="${FINAL_REASON[$i]:-}"
+      local tips_str="${FINAL_TIPS_MAP[$i]:-}"
+
+      jq -n \
+        --argjson id "$id" \
+        --arg status "$status" \
+        --arg note "$original_note" \
+        --arg reason "$final_reason" \
+        --arg tips "$tips_str" \
+        '{id:$id, status:$status, note:$note, reason:$reason, tips:($tips | split("\n") | map(select(. != "")))}' >> "$tmp_items"
+    fi
+
     # Add a comma between objects, but not after the last one
     if (( i < 15 )); then
       echo ',' >> "$tmp_items"
