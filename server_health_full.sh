@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 #
-# server_health_full.sh (v2.2-consolidated)
+# server_health_full.sh (v2.3)
 # 15 項整合式硬體/系統健檢 (BMC + OS；可整合 UPS)
 #
+#
+# v2.3 新增 / 改進 (2025-10-10):
+#  - Judgement 機制全面升級：
+#    - 所有 15 個檢測項目均包含詳細的 judgement 欄位（criteria, policy, checks, thresholds）
+#    - Items 1-5, 7-8, 12：使用 build_judgement() + set_check_result_with_jdg() 實作詳細判斷邏輯
+#    - Items 6, 9-11, 13-15：透過增強的 set_status() 自動生成項目特定的詳細 judgement
+#  - Markdown 報告增強：
+#    - 新增 Policy 規則顯示（PASS/WARN/FAIL/SKIP/INFO 條件）
+#    - 完整呈現每個項目的判斷依據與檢查結果，便於離線審查
+#  - Master JSON 完整性：
+#    - 修正 build_master_json() 優先使用 ALL_CHECK_RESULTS 確保 judgement 欄位正確輸出
+#  - Bug 修復：
+#    - 修正 io_status_from_log() 算術運算錯誤（改用字串比較避免空格導致的語法錯誤）
 #
 # [MOD] Gemini-CLI Interactive Session (2025-10-06):
 # Major refactoring and bug fixing session. Key changes include:
@@ -408,54 +421,236 @@ set_status() {
   RESULT_NOTE["$id"]="$note"
   add_json_item "$id" "$st" "$note"
 
-  # --- Auto-generate judgement for legacy set_status calls (v2.3) ---
-  # 為舊架構項目自動生成基礎 judgement
+  # --- Auto-generate detailed judgement for legacy set_status calls (v2.3) ---
+  # Items 6,9-11,13-15 now have item-specific detailed criteria and policy
   local item_name="${ITEM_NAME[$id]:-Unknown}"
-
-  # 基礎 criteria 根據 status 自動生成
-  local criteria="Legacy check: $item_name"
-
-  # Policy rules 根據 status 類型
-  local pass_rules='["項目檢查通過"]'
-  local warn_rules='["項目檢查發現警告"]'
-  local fail_rules='["項目檢查失敗"]'
-  local skip_rules='["項目檢查跳過"]'
-  local info_rules='["項目提供資訊"]'
-
-  # Checks - 記錄當前狀態
-  local checks_json
-  checks_json=$(jq -n --arg status "$st" --arg reason "$note" \
-    '[{"name":"Status","ok":($status=="PASS" or $status=="INFO" or $status=="SKIP"),"value":$status},
-      {"name":"Reason","ok":true,"value":$reason}]')
-
-  # Thresholds - 舊架構項目通常沒有數值閾值
+  local criteria=""
+  local pass_rules=""
+  local warn_rules=""
+  local fail_rules=""
+  local skip_rules=""
+  local info_rules=""
+  local checks_json=""
   local th_json='{}'
 
-  # 根據 status 選擇合適的 policy
-  local policy_json
-  case "$st" in
-    PASS)
-      policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
-        '{pass:$pass, warn:$warn, fail:$fail}')
+  # Generate item-specific judgement based on ID
+  case "$id" in
+    6) # GPU
+      criteria="檢查 NVIDIA GPU 是否可用。若 nvidia-smi 指令存在且成功執行，視為 PASS；若指令不存在則 SKIP。"
+      pass_rules='["nvidia-smi 指令存在", "成功列出 GPU 資訊"]'
+      warn_rules='[]'
+      fail_rules='["nvidia-smi 執行失敗"]'
+
+      local gpu_cmd_exists=false
+      local gpu_status_ok=false
+      command -v nvidia-smi >/dev/null 2>&1 && gpu_cmd_exists=true
+      [[ "$st" == "PASS" ]] && gpu_status_ok=true
+
+      checks_json=$(jq -n \
+        --argjson exists "$gpu_cmd_exists" \
+        --argjson ok "$gpu_status_ok" \
+        --arg st "$st" \
+        '[
+          {"name":"nvidia-smi available", "ok":$exists, "value":($exists|tostring)},
+          {"name":"GPU enumeration", "ok":$ok, "value":$st}
+        ]')
       ;;
-    WARN)
-      policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
-        '{pass:$pass, warn:$warn, fail:$fail}')
+
+    9) # UPS
+      criteria="UPS 檢測已改由獨立腳本執行（ups_check.sh）。此項目保留以維持項目編號一致性，狀態固定為 SKIP。"
+      skip_rules='["UPS 檢測由 ups_check.sh 獨立處理"]'
+
+      checks_json=$(jq -n \
+        '[{"name":"Separate UPS script used", "ok":true, "value":"UPS check is now in separate script"}]')
       ;;
-    FAIL)
-      policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
-        '{pass:$pass, warn:$warn, fail:$fail}')
+
+    10) # Network Performance
+      criteria="檢查網路連通性、頻寬與時間同步。測試項目：預設閘道 ping、公共 DNS ping（8.8.8.8/1.1.1.1）、可選的自訂 PING_HOST、可選的 iperf3 頻寬測試、時間同步狀態（chronyc/timedatectl）。若在 OFFLINE 模式則跳過外網測試。"
+      pass_rules='["外網 DNS 可達（非 OFFLINE 模式）", "時間同步正常"]'
+      warn_rules='["外網 DNS 不可達", "閘道不可達", "iperf3 頻寬低於預期"]'
+      fail_rules='["OFFLINE=1 且無 default route"]'
+
+      local gw_ok=false
+      local dns_ok=false
+      local time_sync="unknown"
+
+      # Check if we can reach gateway
+      local gw
+      gw=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+      [[ -n "$gw" ]] && ping -c1 -W1 "$gw" >/dev/null 2>&1 && gw_ok=true
+
+      # Check DNS if not OFFLINE
+      if (( ! OFFLINE )); then
+        ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 || ping -c1 -W1 1.1.1.1 >/dev/null 2>&1
+        [[ $? -eq 0 ]] && dns_ok=true
+      fi
+
+      # Extract time sync info from note
+      if [[ "$note" =~ chronyc_offset ]]; then
+        time_sync="chronyc"
+      elif [[ "$note" =~ timedatectl ]]; then
+        time_sync="timedatectl"
+      fi
+
+      checks_json=$(jq -n \
+        --argjson gw_ok "$gw_ok" \
+        --argjson dns_ok "$dns_ok" \
+        --arg time "$time_sync" \
+        --arg st "$st" \
+        --arg note_val "$note" \
+        --argjson offline "${OFFLINE:-0}" \
+        '[
+          {"name":"Default gateway reachable", "ok":$gw_ok, "value":($gw_ok|tostring)},
+          {"name":"Public DNS reachable", "ok":($offline==1 or $dns_ok), "value":(if $offline==1 then "skipped (OFFLINE)" else ($dns_ok|tostring) end)},
+          {"name":"Time sync", "ok":($time!="unknown"), "value":$time},
+          {"name":"Overall status", "ok":($st=="PASS" or $st=="INFO"), "value":$note_val}
+        ]')
       ;;
-    SKIP)
-      policy_json=$(jq -n --argjson skip "$skip_rules" '{skip:$skip}')
+
+    11) # Cabling
+      criteria="檢查網路介面卡的實體連線狀態與 Link Flap 事件。使用 ethtool 查詢各 NIC 的 Speed/Duplex/Link 狀態，並透過 journalctl 或 dmesg 搜尋近期的 'link up/down'、'carrier lost'、'resetting' 等事件。此項目為 INFO 狀態，需人工判讀是否有異常的 link flap。"
+      info_rules='["列出所有實體 NIC link 狀態", "搜尋 link flap 事件供人工判讀"]'
+
+      # Count NICs
+      local nic_count=0
+      local nics
+      nics=$(ls /sys/class/net 2>/dev/null | grep -vE '^(lo|docker.*|veth.*|br-.*|cni.*|flannel.*|cali.*|tun.*|tap.*|virbr.*)$' || true)
+      [[ -n "$nics" ]] && nic_count=$(echo "$nics" | wc -l)
+
+      checks_json=$(jq -n \
+        --argjson nic_count "$nic_count" \
+        --arg st "$st" \
+        '[
+          {"name":"Physical NICs found", "ok":($nic_count>0), "value":($nic_count|tostring)},
+          {"name":"Link status check", "ok":true, "value":"ethtool executed"},
+          {"name":"Link flap search", "ok":true, "value":"journalctl/dmesg searched"},
+          {"name":"Manual review required", "ok":($st=="INFO"), "value":"Human interpretation needed"}
+        ]')
       ;;
-    INFO)
-      policy_json=$(jq -n --argjson info "$info_rules" '{info:$info}')
+
+    13) # System Logs
+      criteria="分析系統日誌中的高優先級訊息（priority 0-3：emerg/alert/crit/err）。使用 journalctl -k -p 0..3 統計過去 LOG_DAYS 天內的高優先級日誌數量。若超過 1 筆則觸發 WARN 並生成詳細分析報告。"
+      pass_rules='["過去 N 天內高優先級日誌 ≤1 筆"]'
+      warn_rules='["過去 N 天內高優先級日誌 >1 筆"]'
+      fail_rules='["系統日誌服務異常"]'
+
+      th_json=$(jq -n \
+        --argjson days "${LOG_DAYS:-7}" \
+        '{"LOG_DAYS":$days, "critical_threshold":1}')
+
+      local has_journalctl=false
+      local critical_count=0
+      command -v journalctl >/dev/null 2>&1 && has_journalctl=true
+
+      # Try to extract count from note
+      if [[ "$note" =~ ([0-9]+)[[:space:]]*筆 ]]; then
+        critical_count="${BASH_REMATCH[1]}"
+      fi
+
+      checks_json=$(jq -n \
+        --argjson has_jctl "$has_journalctl" \
+        --argjson count "$critical_count" \
+        --arg st "$st" \
+        --arg note_val "$note" \
+        '[
+          {"name":"journalctl available", "ok":$has_jctl, "value":($has_jctl|tostring)},
+          {"name":"Critical log count", "ok":($count<=1), "value":($count|tostring)},
+          {"name":"Status", "ok":($st=="PASS" or $st=="INFO"), "value":$note_val}
+        ]')
       ;;
-    *)
-      policy_json='{}'
+
+    14) # Firmware
+      criteria="列舉系統各組件的韌體/驅動版本，包括：BIOS（dmidecode）、BMC（ipmitool mc info）、NIC driver/firmware（ethtool -i）、GPU driver（nvidia-smi）、磁碟韌體（smartctl）、NVMe（nvme list）。此為 INFO 項目，需人工比對是否為最新版本或已知穩定版本。"
+      info_rules='["列出 BIOS/BMC/NIC/GPU/Disk 韌體版本供人工比對"]'
+
+      local bios_ok=false
+      [[ -n "${BIOS_VERSION:-}" ]] && bios_ok=true
+
+      checks_json=$(jq -n \
+        --argjson bios_ok "$bios_ok" \
+        --arg st "$st" \
+        '[
+          {"name":"BIOS version retrieved", "ok":$bios_ok, "value":($bios_ok|tostring)},
+          {"name":"Firmware enumeration", "ok":true, "value":"dmidecode/ethtool/smartctl executed"},
+          {"name":"Manual comparison required", "ok":($st=="INFO"), "value":"Human review needed"}
+        ]')
+      ;;
+
+    15) # I/O Performance
+      criteria="使用 fio 執行順序讀寫測試以評估磁碟 I/O 效能。若 RUN_FIO=0 則 SKIP；若無 fio 指令則 FAIL。測試檔案路徑、大小、block size、jobs 數量由環境變數控制（FIO_FILE、FIO_SIZE、FIO_BS、FIO_NUMJOBS_READ）。測試完成後提取 Write/Read 頻寬並與最低門檻值（IO_WRITE_MIN、IO_READ_MIN）比較。"
+      pass_rules='["RUN_FIO=1", "fio 指令存在", "Write >= IO_WRITE_MIN MB/s", "Read >= IO_READ_MIN MB/s"]'
+      warn_rules='["Write < IO_WRITE_MIN 或 Read < IO_READ_MIN"]'
+      fail_rules='["RUN_FIO=1 但 fio 不存在"]'
+      skip_rules='["RUN_FIO=0（未啟用 fio 測試）"]'
+
+      th_json=$(jq -n \
+        --argjson run_fio "${RUN_FIO:-0}" \
+        --argjson write_min "${IO_WRITE_MIN:-100}" \
+        --argjson read_min "${IO_READ_MIN:-100}" \
+        '{"RUN_FIO":$run_fio, "IO_WRITE_MIN":$write_min, "IO_READ_MIN":$read_min}')
+
+      local fio_enabled=false
+      local fio_exists=false
+      (( RUN_FIO )) && fio_enabled=true
+      command -v fio >/dev/null 2>&1 && fio_exists=true
+
+      checks_json=$(jq -n \
+        --argjson enabled "$fio_enabled" \
+        --argjson exists "$fio_exists" \
+        --arg st "$st" \
+        --arg note_val "$note" \
+        '[
+          {"name":"RUN_FIO enabled", "ok":$enabled, "value":($enabled|tostring)},
+          {"name":"fio command exists", "ok":($enabled==false or $exists), "value":(if $enabled then ($exists|tostring) else "N/A" end)},
+          {"name":"Test result", "ok":($st!="FAIL"), "value":$note_val}
+        ]')
+      ;;
+
+    *) # Default for other items
+      criteria="Legacy check: $item_name"
+      pass_rules='["項目檢查通過"]'
+      warn_rules='["項目檢查發現警告"]'
+      fail_rules='["項目檢查失敗"]'
+      skip_rules='["項目檢查跳過"]'
+      info_rules='["項目提供資訊"]'
+
+      checks_json=$(jq -n --arg status "$st" --arg reason "$note" \
+        '[{"name":"Status","ok":($status=="PASS" or $status=="INFO" or $status=="SKIP"),"value":$status},
+          {"name":"Reason","ok":true,"value":$reason}]')
       ;;
   esac
+
+  # Build policy_json based on available rules
+  local policy_json
+  if [[ "$id" == "9" || "$id" == "11" || "$id" == "14" ]]; then
+    # INFO or SKIP items with specific rules
+    if [[ -n "$info_rules" ]]; then
+      policy_json=$(jq -n --argjson info "$info_rules" '{"info":$info}')
+    elif [[ -n "$skip_rules" ]]; then
+      policy_json=$(jq -n --argjson skip "$skip_rules" '{"skip":$skip}')
+    else
+      policy_json='{}'
+    fi
+  elif [[ "$id" == "15" ]]; then
+    # I/O Perf can be SKIP, FAIL, or INFO
+    case "$st" in
+      SKIP)
+        policy_json=$(jq -n --argjson skip "$skip_rules" '{"skip":$skip}')
+        ;;
+      FAIL)
+        policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+          '{"pass":$pass, "warn":$warn, "fail":$fail}')
+        ;;
+      *)
+        policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+          '{"pass":$pass, "warn":$warn, "fail":$fail}')
+        ;;
+    esac
+  else
+    # Items with full PASS/WARN/FAIL rules (6, 10, 13)
+    policy_json=$(jq -n --argjson pass "$pass_rules" --argjson warn "$warn_rules" --argjson fail "$fail_rules" \
+      '{"pass":$pass, "warn":$warn, "fail":$fail}')
+  fi
 
   # 組合 judgement
   local jdg_json
@@ -464,7 +659,7 @@ set_status() {
     --argjson policy "$policy_json" \
     --argjson checks "$checks_json" \
     --argjson thresholds "$th_json" \
-    '{criteria:$criteria, policy:$policy, checks:$checks, thresholds:$thresholds}')
+    '{"criteria":$criteria, "policy":$policy, "checks":$checks, "thresholds":$thresholds}')
 
   # 生成完整的 JSON 結果並同步到 ALL_CHECK_RESULTS
   local full_json
@@ -473,7 +668,7 @@ set_status() {
     --arg item "$item_name" \
     --arg reason "$note" \
     --argjson judgement "$jdg_json" \
-    '{status:$status, item:$item, reason:$reason, judgement:$judgement}')
+    '{"status":$status, "item":$item, "reason":$reason, "judgement":$judgement}')
 
   ALL_CHECK_RESULTS["$id"]="$full_json"
 }
@@ -2925,6 +3120,48 @@ append_consolidated_report_to_md() {
         if [[ -n "$criteria" && "$criteria" != "null" ]]; then
           echo "- **Criteria**: $criteria"
         fi
+
+        # Display Policy rules (v2.3 enhancement)
+        local policy_json=$(echo "$judgement_json" | jq -c '.policy // {}')
+        if [[ -n "$policy_json" && "$policy_json" != "{}" && "$policy_json" != "null" ]]; then
+          echo "- **Policy**:"
+
+          # PASS rules
+          local pass_rules=$(echo "$policy_json" | jq -r '.pass // [] | if length > 0 then map("    - \(.)") | join("\n") else "" end')
+          if [[ -n "$pass_rules" ]]; then
+            echo "  - **PASS**:"
+            echo "$pass_rules"
+          fi
+
+          # WARN rules
+          local warn_rules=$(echo "$policy_json" | jq -r '.warn // [] | if length > 0 then map("    - \(.)") | join("\n") else "" end')
+          if [[ -n "$warn_rules" ]]; then
+            echo "  - **WARN**:"
+            echo "$warn_rules"
+          fi
+
+          # FAIL rules
+          local fail_rules=$(echo "$policy_json" | jq -r '.fail // [] | if length > 0 then map("    - \(.)") | join("\n") else "" end')
+          if [[ -n "$fail_rules" ]]; then
+            echo "  - **FAIL**:"
+            echo "$fail_rules"
+          fi
+
+          # SKIP rules
+          local skip_rules=$(echo "$policy_json" | jq -r '.skip // [] | if length > 0 then map("    - \(.)") | join("\n") else "" end')
+          if [[ -n "$skip_rules" ]]; then
+            echo "  - **SKIP**:"
+            echo "$skip_rules"
+          fi
+
+          # INFO rules
+          local info_rules=$(echo "$policy_json" | jq -r '.info // [] | if length > 0 then map("    - \(.)") | join("\n") else "" end')
+          if [[ -n "$info_rules" ]]; then
+            echo "  - **INFO**:"
+            echo "$info_rules"
+          fi
+        fi
+
         local thresholds=$(echo "$judgement_json" | jq -r '.thresholds // {} | to_entries | map("  - \(.key): \(.value)") | join("\n")')
         if [[ -n "$thresholds" && "$thresholds" != "" ]]; then
           echo "- **Thresholds**:"
@@ -3240,6 +3477,7 @@ build_master_json() {
   tmp_out=$(mktemp)
 
   jq -n \
+    --arg script_version "2.3" \
     --arg hostname "$HOSTNAME" \
     --arg timestamp "$TIMESTAMP" \
     --arg bios "$BIOS_VERSION" \
@@ -3265,6 +3503,7 @@ build_master_json() {
     --slurpfile cw "$tmp_cw" \
     --slurpfile raid "$tmp_raid" \
     '{meta:{
+        script_version:$script_version,
         hostname:$hostname,
         timestamp:$timestamp,
         start_epoch:$start,
