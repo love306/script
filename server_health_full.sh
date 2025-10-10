@@ -117,6 +117,11 @@ NIC_BASELINE_FILE=""
 STORCLI_BIN="/opt/MegaRAID/storcli/storcli64"
 RAID_CONTROLLER_LIST=""   # 使用者指定 (例如: "0,1")
 
+# ---- NIC Warn thresholds (can override via env) ----
+: "${NIC_WARN_MIN_DELTA:=100}"             # 最低 Δrx_dropped
+: "${NIC_WARN_MIN_PCT:=0.01}"              # 最低丟包百分比 (%)
+: "${NIC_WARN_MIN_RX_DROP_RATE:=0.5}"      # 最低 Δrx_dropped / sec
+
 # === CONSOLIDATE START ===
 # [NEW] 整合報告相關參數
 # Thresholds from public_report_builder
@@ -1546,7 +1551,7 @@ write_nic_baseline(){
   {
     echo "# nic,key,value (auto-generated baseline for next run)"
     for nic in $(ls /sys/class/net | grep -vE 'lo|docker|veth|br-' || true); do
-      for key in rx_errors tx_errors rx_dropped tx_dropped rx_crc_errors; do
+      for key in rx_errors tx_errors rx_dropped tx_dropped rx_crc_errors rx_packets; do
         local path="/sys/class/net/$nic/statistics/$key"
         if [[ -f "$path" ]]; then
             local val
@@ -1567,7 +1572,7 @@ check_nic() {
     load_nic_baseline
 
     local final_status="PASS"
-    local final_reason="NIC counters are stable."
+    local final_reason=""
     local reason_details=()
     local metrics_array=()
 
@@ -1614,33 +1619,6 @@ check_nic() {
         softnet_rate_per_sec="0"
     fi
 
-    # === NIC counters：優先 ethtool .nic，備援 sysfs ===
-    _read_nic_counters() {
-        local nic="$1"
-        local rx_drop tx_drop rx_err tx_err rx_crc src="sysfs"
-        if ethtool -S "$nic" >/dev/null 2>&1; then
-            rx_drop=$(ethtool -S "$nic" 2>/dev/null | awk -F: '/rx_dropped\.nic/{gsub(/ /,"",$2);print $2}')
-            tx_drop=$(ethtool -S "$nic" 2>/dev/null | awk -F: '/tx_dropped\.nic/{gsub(/ /,"",$2);print $2}')
-            rx_err=$(ethtool -S "$nic" 2>/dev/null  | awk -F: '/rx_errors(\.nic)?/{gsub(/ /,"",$2);print $2}')
-            tx_err=$(ethtool -S "$nic" 2>/dev/null  | awk -F: '/tx_errors(\.nic)?/{gsub(/ /,"",$2);print $2}')
-            rx_crc=$(ethtool -S "$nic" 2>/dev/null  | awk -F: '/rx_crc_errors(\.nic)?/{gsub(/ /,"",$2);print $2}')
-            [[ -z "$rx_drop" ]] && rx_drop=$(cat /sys/class/net/"$nic"/statistics/rx_dropped 2>/dev/null || echo 0)
-            [[ -z "$tx_drop" ]] && tx_drop=$(cat /sys/class/net/"$nic"/statistics/tx_dropped 2>/dev/null || echo 0)
-            [[ -z "$rx_err"  ]] && rx_err=$(cat /sys/class/net/"$nic"/statistics/rx_errors 2>/dev/null || echo 0)
-            [[ -z "$tx_err"  ]] && tx_err=$(cat /sys/class/net/"$nic"/statistics/tx_errors 2>/dev/null || echo 0)
-            [[ -z "$rx_crc"  ]] && rx_crc=$(cat /sys/class/net/"$nic"/statistics/rx_crc_errors 2>/dev/null || echo 0)
-            src="ethtool+sysfs"
-        else
-            rx_drop=$(cat /sys/class/net/"$nic"/statistics/rx_dropped 2>/dev/null || echo 0)
-            tx_drop=$(cat /sys/class/net/"$nic"/statistics/tx_dropped 2>/dev/null || echo 0)
-            rx_err=$(cat /sys/class/net/"$nic"/statistics/rx_errors 2>/dev/null || echo 0)
-            tx_err=$(cat /sys/class/net/"$nic"/statistics/tx_errors 2>/dev/null || echo 0)
-            rx_crc=$(cat /sys/class/net/"$nic"/statistics/rx_crc_errors 2>/dev/null || echo 0)
-            src="sysfs"
-        fi
-        echo "$rx_drop,$tx_drop,$rx_err,$tx_err,$rx_crc,$src"
-    }
-
     # 排除 lo/docker/veth/bridge/tunnel 類虛擬介面
     local nics
     nics=$(ls /sys/class/net | grep -vE '^(lo|docker.*|veth.*|br-.*|cni.*|flannel.*|cali.*|tun.*|tap.*|virbr.*)$' || true)
@@ -1664,86 +1642,94 @@ check_nic() {
         if [[ "$have_softnet_baseline" == "1" && "$SOFTNET_DELTA" -gt 0 ]]; then
             final_status="WARN"
             reason_details+=("softnet_drops+=$SOFTNET_DELTA (~${softnet_rate_per_sec}/s)")
-        elif [[ "$have_softnet_baseline" == "0" ]]; then
-            reason_details+=("softnet baseline initialized")
         fi
 
-        # 逐介面檢查 + 每秒增量率
+        # 逐介面檢查
         for nic in $nics; do
-            IFS=, read -r rx_d tx_d rx_e tx_e rx_crc src < <(_read_nic_counters "$nic")
-            rx_d=${rx_d:-0}; tx_d=${tx_d:-0}; rx_e=${rx_e:-0}; tx_e=${tx_e:-0}; rx_crc=${rx_crc:-0}
+            local ethtool_out speed duplex link_detected
+            ethtool_out=$(ethtool "$nic" 2>/dev/null)
+            speed=$(echo "$ethtool_out" | grep -i 'Speed' | awk -F: '{print $2}' | xargs)
+            duplex=$(echo "$ethtool_out" | grep -i 'Duplex' | awk -F: '{print $2}' | xargs)
+            link_detected=$(echo "$ethtool_out" | grep -i 'Link detected' | awk -F: '{print $2}' | xargs)
 
-            # baseline 值（沒有 baseline 就先初始化）
-            local p_rx_d=${NIC_PREV["$nic:rx_dropped"]:-$rx_d}
-            local p_tx_d=${NIC_PREV["$nic:tx_dropped"]:-$tx_d}
-            local p_rx_e=${NIC_PREV["$nic:rx_errors"]:-$rx_e}
-            local p_tx_e=${NIC_PREV["$nic:tx_errors"]:-$tx_e}
-            local p_rx_crc=${NIC_PREV["$nic:rx_crc_errors"]:-$rx_crc}
-
-            # Δ 計算
-            local d_rx_d=$((rx_d - p_rx_d))
-            local d_tx_d=$((tx_d - p_tx_d))
-            local d_rx_e=$((rx_e - p_rx_e))
-            local d_tx_e=$((tx_e - p_tx_e))
-            local d_rx_crc=$((rx_crc - p_rx_crc))
-            (( d_rx_d < 0 )) && d_rx_d=0
-            (( d_tx_d < 0 )) && d_tx_d=0
-            (( d_rx_e < 0 )) && d_rx_e=0
-            (( d_tx_e < 0 )) && d_tx_e=0
-            (( d_rx_crc < 0 )) && d_rx_crc=0
-
-            # 每秒增量率（用同一個 window_seconds_used）
-            local r_rx_d r_tx_d r_rx_e r_tx_e r_rx_crc
-            if (( window_seconds_used > 0 )); then
-                r_rx_d=$(awk -v d="$d_rx_d"   -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.6f", d/w; else print 0 }')
-                r_tx_d=$(awk -v d="$d_tx_d"   -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.6f", d/w; else print 0 }')
-                r_rx_e=$(awk -v d="$d_rx_e"   -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.6f", d/w; else print 0 }')
-                r_tx_e=$(awk -v d="$d_tx_e"   -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.6f", d/w; else print 0 }')
-                r_rx_crc=$(awk -v d="$d_rx_crc" -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.6f", d/w; else print 0 }')
-            else
-                r_rx_d="0"; r_tx_d="0"; r_rx_e="0"; r_tx_e="0"; r_rx_crc="0"
+            local rx_pkts_path="/sys/class/net/$nic/statistics/rx_packets"
+            local rx_pkts_now=0 rx_pkts_prev=0 d_rx_pkts=0
+            if [[ -f "$rx_pkts_path" ]]; then
+              rx_pkts_now=$(cat "$rx_pkts_path" 2>/dev/null || echo 0)
+              rx_pkts_prev=${NIC_PREV["$nic:rx_packets"]:-$rx_pkts_now}
+              (( rx_pkts_now > rx_pkts_prev )) && d_rx_pkts=$(( rx_pkts_now - rx_pkts_prev )) || d_rx_pkts=0
             fi
 
-            # 收錄 metrics（含絕對值、Δ、rate）
-            metrics_array+=("$(jq -n \
+            local counter_increments='{}'
+            for key in rx_dropped tx_dropped rx_errors tx_errors rx_crc_errors; do
+                local path="/sys/class/net/$nic/statistics/$key"
+                if [[ -f "$path" ]]; then
+                    local val_now val_prev diff
+                    val_now=$(cat "$path" 2>/dev/null || echo 0)
+                    val_prev=${NIC_PREV["$nic:$key"]:-$val_now}
+                    diff=0
+                    (( val_now > val_prev )) && diff=$(( val_now - val_prev ))
+                    if (( diff > 0 )); then
+                        counter_increments=$(echo "$counter_increments" | jq --arg k "$key" --argjson v "$diff" '. + {($k): $v}')
+                    fi
+                fi
+            done
+
+            local d_rx_d=$(echo "$counter_increments" | jq -r '.rx_dropped // 0')
+            
+            local win=${window_seconds_used:-0}
+            (( win <= 0 )) && win=1
+            local r_rx_d=$(awk -v a="$d_rx_d" -v b="$win" 'BEGIN{printf "%.6f", a/b}')
+
+            local drop_pct="0.000000"
+            if (( d_rx_pkts > 0 )); then
+              drop_pct=$(awk -v d="$d_rx_d" -v p="$d_rx_pkts" 'BEGIN{printf "%.6f", (d/p)*100.0}')
+            fi
+
+            local warn_hit=0
+            if (( $(awk -v d="$d_rx_d" -v th="$NIC_WARN_MIN_DELTA" 'BEGIN{print (d>=th)}') )) && \
+               (( $(awk -v p="$drop_pct" -v th="$NIC_WARN_MIN_PCT" 'BEGIN{print (p>=th)}') )) && \
+               (( $(awk -v r="$r_rx_d" -v th="$NIC_WARN_MIN_RX_DROP_RATE" 'BEGIN{print (r>=rth)}') )); then
+                warn_hit=1
+            fi
+
+            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct}%, rate=${r_rx_d}/s"
+            if (( warn_hit == 1 )); then
+              final_status="WARN"
+              reason_details+=("$nic_summary (Thresholds: Δ>=$NIC_WARN_MIN_DELTA, %>=$NIC_WARN_MIN_PCT, rate>=$NIC_WARN_MIN_RX_DROP_RATE/s)")
+            else
+              reason_details+=("$nic_summary")
+            fi
+
+            local metric_json
+            metric_json=$(jq -n \
               --arg scope "iface" \
               --arg iface "$nic" \
-              --arg src "$src" \
-              --argjson rx_d "$rx_d" --argjson tx_d "$tx_d" \
-              --argjson rx_e "$rx_e" --argjson tx_e "$tx_e" \
-              --argjson rx_crc "$rx_crc" \
-              --argjson d_rx_d "$d_rx_d" --argjson d_tx_d "$d_tx_d" \
-              --argjson d_rx_e "$d_rx_e" --argjson d_tx_e "$d_tx_e" \
-              --argjson d_rx_crc "$d_rx_crc" \
-              --arg r_rx_d "$r_rx_d" --arg r_tx_d "$r_tx_d" \
-              --arg r_rx_e "$r_rx_e" --arg r_tx_e "$r_tx_e" \
-              --arg r_rx_crc "$r_rx_crc" \
-              '{scope:$scope, iface:$iface, source:$src,
-                rx_dropped:$rx_d, tx_dropped:$tx_d, rx_errors:$rx_e, tx_errors:$tx_e, rx_crc_errors:$rx_crc,
-                rx_dropped_delta:$d_rx_d, tx_dropped_delta:$d_tx_d, rx_errors_delta:$d_rx_e, tx_errors_delta:$d_tx_e, rx_crc_errors_delta:$d_rx_crc,
-                rx_dropped_rate_per_sec:($r_rx_d|tonumber), tx_dropped_rate_per_sec:($r_tx_d|tonumber),
-                rx_errors_rate_per_sec:($r_rx_e|tonumber), tx_errors_rate_per_sec:($r_tx_e|tonumber),
-                rx_crc_errors_rate_per_sec:($r_rx_crc|tonumber)}'
-            )")
-
-            # 判斷是否 WARN（只有第二次以後才比較）
-            if [[ -n "$NIC_BASELINE_FILE" && -f "$NIC_BASELINE_FILE" ]]; then
-                if (( d_rx_d>0 || d_tx_d>0 || d_rx_e>0 || d_tx_e>0 || d_rx_crc>0 )); then
-                    final_status="WARN"
-                    reason_details+=("$nic:Δrx_d=$d_rx_d (≈${r_rx_d}/s),Δtx_d=$d_tx_d (≈${r_tx_d}/s),Δrx_e=$d_rx_e,Δtx_e=$d_tx_e,Δrx_crc=$d_rx_crc")
-                fi
-            fi
+              --arg speed "$speed" \
+              --arg duplex "$duplex" \
+              --arg link "$link_detected" \
+              --argjson increments "$counter_increments" \
+              --argjson rx_pkts_now "$rx_pkts_now" \
+              --argjson rx_pkts_delta "$d_rx_pkts" \
+              --arg rx_drop_rate_per_sec "$r_rx_d" \
+              --arg drop_percentage "$drop_pct" \
+              --argjson thresholds "$(jq -n --argjson d "$NIC_WARN_MIN_DELTA" --arg p "$NIC_WARN_MIN_PCT" --arg r "$NIC_WARN_MIN_RX_DROP_RATE" \
+                                       '{min_delta:$d, min_pct:($p|tonumber), min_rx_drop_rate_per_sec:($r|tonumber)}')" \
+              '{scope:$scope, iface:$iface, speed:$speed, duplex:$duplex, link:$link,
+                counters:$increments,
+                rx_packets:($rx_pkts_now|tonumber), rx_packets_delta:$rx_pkts_delta,
+                rx_dropped_rate_per_sec:($rx_drop_rate_per_sec|tonumber),
+                drop_percentage:($drop_percentage|tonumber), thresholds:$thresholds }')
+            metrics_array+=("$metric_json")
         done
 
-        # 更新 baseline（NIC 舊流程）+ softnet baseline（新格式：值 + 時戳）
-        write_nic_baseline
-        if [[ -n "$SOFTNET_BASELINE_FILE" ]]; then
-            echo "$SOFTNET_NOW $NOW_TS" > "$SOFTNET_BASELINE_FILE"
+        if [[ "$final_status" == "PASS" ]]; then
+            final_reason="NIC counters stable. Details: $(IFS=; echo "${reason_details[*]}")"
+        else
+            final_reason="NIC issues detected. Details: $(IFS=; echo "${reason_details[*]}")"
         fi
-
-        if [[ "$final_status" != "PASS" ]]; then
-            final_reason="Counter increments detected: $(IFS=,; echo "${reason_details[*]}")"
-        elif [[ ! -f "$NIC_BASELINE_FILE" ]]; then
+        
+        if [[ ! -f "$NIC_BASELINE_FILE" ]]; then
             final_reason="Baseline initialized; counters will be compared on next run."
         fi
     fi
@@ -2776,7 +2762,10 @@ if [[ -n "$THRESHOLDS_JSON" ]]; then
   "fio_enabled": $RUN_FIO,
   "net_iperf_min": $NET_IPERF_MIN,
   "io_read_min": $IO_READ_MIN,
-  "io_write_min": $IO_WRITE_MIN
+  "io_write_min": $IO_WRITE_MIN,
+  "nic_warn_min_delta":  "$NIC_WARN_MIN_DELTA",
+  "nic_warn_min_pct":    "$NIC_WARN_MIN_PCT",
+  "nic_warn_min_rx_drop_rate": "$NIC_WARN_MIN_RX_DROP_RATE"
 }
 TJSON
   } > "$THRESHOLDS_JSON"
