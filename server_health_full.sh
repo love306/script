@@ -1282,12 +1282,12 @@ check_memory() {
       set_check_result 3 "$result_json"
       return
     fi
-    log_output=$(printf '%s\n' "$journal_raw" | egrep -i 'edac|ecc|mce|machine check|hardware error' || true)
+    log_output=$(printf '%s\n' "$journal_raw" | egrep -i '\bedac\b|\becc\b|\bmce\b|machine check|hardware error' || true)
   else
     echo "[WARN] journalctl not found, attempting sudo dmesg for ECC/MCE check."
     if sudo -n true 2>/dev/null; then
       log_source="sudo dmesg"
-      log_output=$(sudo -n dmesg 2>/dev/null | egrep -i 'edac|ecc|mce|machine check|hardware error' || true)
+      log_output=$(sudo -n dmesg 2>/dev/null | egrep -i '\bedac\b|\becc\b|\bmce\b|machine check|hardware error' || true)
     else
       local reason="journalctl 不可用且缺少免密碼 sudo 無法讀取 dmesg，無法檢查 ECC/MCE"
       local metrics_json
@@ -1537,7 +1537,7 @@ load_nic_baseline(){
   [[ ! -f "$NIC_BASELINE_FILE" ]] && return
   while IFS=, read -r nic key val; do
     [[ -z "$nic" || -z "$key" || -z "$val" ]] && continue
-    NIC_PREV["$nic:$key"]="$val"
+    NIC_PREV["$nic:$key"]="$val"df
   done < <(grep -v '^#' "$NIC_BASELINE_FILE" || true)
 }
 
