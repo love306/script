@@ -2792,8 +2792,14 @@ UPS_JSON_REF=""
 
 # [MOD] Modified to use consolidated results and add new fields
 build_master_json() {
-  # Rebuild items array from consolidated results
-  json_items=()
+  # Create a temporary file to hold the array of item objects
+  local tmp_items
+  tmp_items=$(mktemp)
+
+  # Start the JSON array
+  echo '[' > "$tmp_items"
+
+  # Loop through each check item and generate its JSON object using jq
   for i in $(seq 1 15); do
     local id="$i"
     local status="${FINAL_STATUS[$i]:-NA}"
@@ -2801,35 +2807,33 @@ build_master_json() {
     local final_reason="${FINAL_REASON[$i]:-}"
     local tips_str="${FINAL_TIPS_MAP[$i]:-}"
 
-    local esc_original_note; esc_original_note=$(echo "$original_note" | jq -R . | sed 's/^"//;s/"$//')
-    local esc_final_reason; esc_final_reason=$(echo "$final_reason" | jq -R . | sed 's/^"//;s/"$//')
-
-    local tips_json="[]"
-    if [[ -n "$tips_str" ]]; then
-      tips_json=$(echo "$tips_str" | jq -R . | jq -s .)
+    # Use jq to safely create the JSON object for the current item.
+    # This handles all escaping and ensures the 'tips' field is a proper JSON array of strings.
+    jq -n \
+      --argjson id "$id" \
+      --arg status "$status" \
+      --arg note "$original_note" \
+      --arg reason "$final_reason" \
+      --arg tips "$tips_str" \
+      '{id:$id, status:$status, note:$note, reason:$reason, tips:($tips | split("\n") | map(select(. != "")))}' >> "$tmp_items"
+    
+    # Add a comma between objects, but not after the last one
+    if (( i < 15 )); then
+      echo ',' >> "$tmp_items"
     fi
-
-    json_items+=("{\"id\":$id,\"status\":\"$status\",\"note\":\"$esc_original_note\",\"reason\":\"$esc_final_reason\",\"tips\":$tips_json}")
   done
 
-  local tmp_items=$(mktemp)
-  {
-    echo '['
-    for j in "${!json_items[@]}"; do
-      if (( j < ${#json_items[@]} -1 )); then
-        printf '%s,\n' "${json_items[$j]}"
-      else
-        printf '%s\n' "${json_items[$j]}"
-      fi
-    done
-    echo ']'
-  } > "$tmp_items"
+  # Close the JSON array
+  echo ']' >> "$tmp_items"
 
-  local tmp_top=$(mktemp)
+  # --- The rest of the function remains largely the same, but now uses the robustly generated tmp_items file ---
+
+  local tmp_top
+  tmp_top=$(mktemp)
   {
     echo '['
     for i in "${!SEL_TOP_ARRAY[@]}"; do
-      if (( i < ${#SEL_TOP_ARRAY[@]} -1 )); then
+      if (( i < ${#SEL_TOP_ARRAY[@]} - 1 )); then
         printf '%s,\n' "${SEL_TOP_ARRAY[$i]}"
       else
         printf '%s\n' "${SEL_TOP_ARRAY[$i]}"
@@ -2838,11 +2842,12 @@ build_master_json() {
     echo ']'
   } > "$tmp_top"
 
-  local tmp_cw=$(mktemp)
+  local tmp_cw
+  tmp_cw=$(mktemp)
   {
     echo '['
     for i in "${!SEL_CW_EVENTS_ARRAY[@]}"; do
-      if (( i < ${#SEL_CW_EVENTS_ARRAY[@]} -1 )); then
+      if (( i < ${#SEL_CW_EVENTS_ARRAY[@]} - 1 )); then
         printf '%s,\n' "${SEL_CW_EVENTS_ARRAY[$i]}"
       else
         printf '%s\n' "${SEL_CW_EVENTS_ARRAY[$i]}"
@@ -2851,9 +2856,11 @@ build_master_json() {
     echo ']'
   } > "$tmp_cw"
 
-  local tmp_raid=$(mktemp)
+  local tmp_raid
+  tmp_raid=$(mktemp)
   echo "$RAID_SUMMARY_JSON" > "$tmp_raid"
-  local tmp_out=$(mktemp)
+  local tmp_out
+  tmp_out=$(mktemp)
 
   jq -n \
     --arg hostname "$HOSTNAME" \
@@ -2879,9 +2886,8 @@ build_master_json() {
     --slurpfile items "$tmp_items" \
     --slurpfile top "$tmp_top" \
     --slurpfile cw "$tmp_cw" \
-    --slurpfile raid "$tmp_raid" '
-    {
-      meta:{
+    --slurpfile raid "$tmp_raid" \
+    '{meta:{
         hostname:$hostname,
         timestamp:$timestamp,
         start_epoch:$start,
