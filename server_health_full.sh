@@ -762,6 +762,14 @@ float_ge(){
   awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { exit ((a+0) >= (b+0)) ? 0 : 1 }'
 }
 
+# —— 安全數值工具 —— #
+# 將輸入清理成數字或 0，避免算術展開錯誤
+num_or_0() { printf '%s' "${1:-0}" | awk 'BEGIN{v=0} {if($0 ~ /^-?[0-9]+(\.[0-9]+)?$/) v=$0; print v}'; }
+# a>=b -> exit 0 (成功)
+ge() { awk -v a="$(num_or_0 "$1")" -v b="$(num_or_0 "$2")" 'BEGIN{exit (a>=b)?0:1}'; }
+# a>b -> exit 0 (成功)
+gt() { awk -v a="$(num_or_0 "$1")" -v b="$(num_or_0 "$2")" 'BEGIN{exit (a>b)?0:1}'; }
+
 last_event_epoch_in_sel(){
   local sel="$1" now_epoch="$2" since_days="$3" regex="$4"
   [[ -z "$sel" || ! -f "$sel" || -z "$regex" ]] && { echo ""; return; }
@@ -948,16 +956,16 @@ cabling_status_from_log(){
     summary_ifaces+=("${iface}=${sp_show}/${dup_show}/${lnk_show}")
   done
 
-  if (( have_any == 0 )); then
+  if [[ "${have_any:-0}" == "0" ]]; then
     echo "INFO|No uplink interfaces found to check"
     return
   fi
-  if (( have_yes == 0 )); then
+  if [[ "${have_yes:-0}" == "0" ]]; then
     echo "FAIL|All uplinks down. Details: ${summary_ifaces[*]}. Flaps: $flaps"
     return
   fi
-  if (( flaps > max_flaps )); then warn_reason+="flaps(${flaps})>${max_flaps};"; fi
-  if (( no_cnt > 0 )) || [[ -n "$warn_reason" ]]; then
+  if gt "$flaps" "$max_flaps"; then warn_reason+="flaps(${flaps})>${max_flaps};"; fi
+  if [[ "${no_cnt:-0}" != "0" ]] || [[ -n "$warn_reason" ]]; then
     echo "WARN|${warn_reason} Uplinks: ${summary_ifaces[*]}. Flaps: $flaps"
     return
   fi
@@ -1449,8 +1457,47 @@ check_disks() {
     # --- Sudo pre-check ---
     if ! sudo -n true 2>/dev/null; then
         local reason="無法免密碼執行 sudo，跳過 SMART/NVMe 詳細檢查。"
-        local warn_json=$(jq -n --arg item "$item" --arg reason "$reason" '{status:"WARN", item:$item, reason:$reason}')
-        set_check_result 2 "$warn_json"
+
+        # 建立 base JSON
+        local base_json
+        base_json=$(jq -n \
+          --arg status "WARN" \
+          --arg item "$item" \
+          --arg reason "$reason" \
+          --arg tips "$(get_item_tips 2)" \
+          '{status:$status, item:$item, reason:$reason, tips:($tips|split("\n")|map(select(.!="")))}')
+
+        # 判斷基準
+        local pass_rules='["RAID 控制器/VD/PD 皆正常","SMART/NVMe 健康 OK"]'
+        local warn_rules='["RAID 正常但 SMART/NVMe 因權限/工具缺失而跳過"]'
+        local fail_rules='["RAID 降級/故障或 SMART/NVMe 顯示故障/預警"]'
+
+        # 蒐集能拿到的事證（工具可用性、是否 root、storcli/nvme/smartctl）
+        local can_storcli=false; command -v ${STORCLI_BIN%% *} >/dev/null 2>&1 && can_storcli=true
+        local can_smart=false;   command -v smartctl >/dev/null 2>&1 && can_smart=true
+        local can_nvme=false;    command -v nvme >/dev/null 2>&1 && can_nvme=true
+        local is_root=false;     [[ "$(id -u)" == "0" ]] && is_root=true
+
+        local checks_json
+        checks_json=$(jq -n \
+          --argjson stor "$can_storcli" \
+          --argjson smt  "$can_smart" \
+          --argjson nvm  "$can_nvme" \
+          --argjson root "$is_root" \
+          '[
+            {"name":"storcli 可用","ok":$stor,"value":($stor|tostring)},
+            {"name":"smartctl 可用","ok":$smt,"value":($smt|tostring)},
+            {"name":"nvme 可用","ok":$nvm,"value":($nvm|tostring)},
+            {"name":"root 權限","ok":$root,"value":($root|tostring)}
+          ]')
+
+        local th_json='{"SMART_REQUIRED":true,"NVME_REQUIRED":true,"ROOT_REQUIRED":true}'
+
+        local criteria="磁碟健康：RAID/SMART/NVMe 檢查。無 root/免密碼時以 RAID 結果為主，SMART/NVMe 註記為跳過（WARN）。"
+        local jdg_json
+        jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
+        set_check_result_with_jdg 2 "$base_json" "$jdg_json"
         collect_raid_megaraid
         return
     fi
@@ -1938,7 +1985,7 @@ check_cpu() {
     local pass_rules='["最大 CPU 溫度 <= WARN"]'
     local warn_rules='["WARN < 最大 CPU 溫度 <= CRIT"]'
     local fail_rules='["最大 CPU 溫度 > CRIT"]'
-    local criteria="CPU 溫度：以代表性傳感器最大值比較 WARN/CRIT 門檻"
+    local criteria="CPU 溫度：代表性核心的當前最大值 ≤ WARN（\${CPU_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（\${CPU_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。附帶 90 天峰值與移動平均作對照。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2098,19 +2145,20 @@ check_nic() {
               drop_pct=$(awk -v d="$d_rx_d" -v p="$d_rx_pkts" 'BEGIN{printf "%.6f", (d/p)*100.0}')
             fi
 
+            # 判斷是否異常：只要滿足任一條件即觸發 WARN
             local warn_hit=0
-            if (( $(awk -v d="$d_rx_d" -v th="$NIC_WARN_MIN_DELTA" 'BEGIN{print (d>=th)}') )) && \
-               (( $(awk -v p="$drop_pct" -v th="$NIC_WARN_MIN_PCT" 'BEGIN{print (p>=th)}') )) && \
-               (( $(awk -v r="$r_rx_d" -v th="$NIC_WARN_MIN_RX_DROP_RATE" 'BEGIN{print (r>=rth)}') )); then
-                warn_hit=1
-            fi
+            if ge "$d_rx_d" "$NIC_WARN_MIN_DELTA"; then warn_hit=1; fi
+            if ge "$drop_pct" "$NIC_WARN_MIN_PCT"; then warn_hit=1; fi
+            if ge "$r_rx_d" "$NIC_WARN_MIN_RX_DROP_RATE"; then warn_hit=1; fi
+            # 如果 link down 也視為異常
+            if [[ "${link_detected,,}" == "no" ]]; then warn_hit=1; fi
 
-            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct}%, rate=${r_rx_d}/s"
-            if (( warn_hit == 1 )); then
+            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct}%, rate=${r_rx_d}/s, link=$link_detected"
+            if [[ "$warn_hit" == "1" ]]; then
               final_status="WARN"
-              reason_details+=("$nic_summary (Thresholds: Δ>=$NIC_WARN_MIN_DELTA, %>=$NIC_WARN_MIN_PCT, rate>=$NIC_WARN_MIN_RX_DROP_RATE/s)")
+              reason_details+=("ISSUE|$nic_summary")
             else
-              reason_details+=("$nic_summary")
+              reason_details+=("OK|$nic_summary")
             fi
 
             local metric_json
@@ -2170,20 +2218,26 @@ check_nic() {
       --arg min_rx_drop_rate "$NIC_WARN_MIN_RX_DROP_RATE" \
       '{NIC_WARN_MIN_DELTA: ($min_delta|tonumber), NIC_WARN_MIN_PCT: ($min_pct|tonumber), NIC_WARN_MIN_RX_DROP_RATE: ($min_rx_drop_rate|tonumber)}')
 
+    # 只把標記為 ISSUE 的介面列入 checks (ok:false)
     local checks_json='[]'
-    if [[ ${#reason_details[@]} -gt 0 ]]; then
-        # 有檢測到問題，將各 NIC 的狀況列入 checks
-        for detail in "${reason_details[@]}"; do
-            checks_json=$(echo "$checks_json" | jq --arg d "$detail" '. + [{"name":"NIC Issue","ok":false,"value":$d}]')
-        done
-    else
-        checks_json='[{"name":"所有 NIC 計數器穩定","ok":true,"value":"no delta detected"}]'
+    local has_issues=0
+    for detail in "${reason_details[@]}"; do
+        if [[ "$detail" == "ISSUE|"* ]]; then
+            has_issues=1
+            local clean_detail="${detail#ISSUE|}"
+            checks_json=$(echo "$checks_json" | jq --arg d "$clean_detail" '. + [{"name":"NIC Issue","ok":false,"value":$d}]')
+        fi
+    done
+
+    # 如果沒有 issue，輸出 All checks passed
+    if [[ "$has_issues" == "0" ]]; then
+        checks_json='[{"name":"All checks passed","ok":true,"value":"所有 NIC 計數器穩定"}]'
     fi
 
     local pass_rules='["所有 NIC 計數器無顯著增量（rx_dropped/tx_dropped/rx_errors/tx_errors 等）"]'
-    local warn_rules='["任一 NIC 的錯誤/丟包計數器有增量，但未達嚴重程度"]'
-    local fail_rules='["任一 NIC 介面 down 或嚴重錯誤率超標"]'
-    local criteria="NIC 健康：增量錯誤/丟包在視窗內需 < 閾值（MIN_DELTA/MIN_PCT/MIN_RX_DROP_RATE）"
+    local warn_rules='["任一 NIC 滿足以下任一條件：① Δrx_dropped ≥ MIN_DELTA，② drop% ≥ MIN_PCT，③ rx_drop_rate ≥ MIN_RX_DROP_RATE/s"]'
+    local fail_rules='["任一 NIC 介面 down（link=no）或嚴重錯誤率超標"]'
+    local criteria="NIC 健康：只以錯誤/丟包作為異常判定。於觀測窗內，任一介面滿足下列任一條件即為異常：① Δrx_dropped ≥ \${NIC_WARN_MIN_DELTA}，② drop% ≥ \${NIC_WARN_MIN_PCT}% ，③ rx_drop_rate ≥ \${NIC_WARN_MIN_RX_DROP_RATE}/s。否則視為穩定。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2371,7 +2425,7 @@ check_fans() {
     local pass_rules='["所有風扇轉速 >= FAN_RPM_TH 且偏差 <= 20%"]'
     local warn_rules='["任一風扇轉速 < FAN_RPM_TH 或 20% < 偏差 <= 40%"]'
     local fail_rules='["任一風扇偏差 > 40%"]'
-    local criteria="風扇健康：轉速 >= 閾值且相對 baseline 偏差在合理範圍"
+    local criteria="風扇健康：所有風扇 RPM ≥ \${FAN_RPM_TH}；相對 baseline 偏差 ≤ \${DEVIATION_WARN_PCT}% 為 PASS；偏差 > \${DEVIATION_CRIT_PCT}% 為 FAIL。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2601,7 +2655,7 @@ check_env() {
     local pass_rules='["最大環境溫度 <= WARN"]'
     local warn_rules='["WARN < 最大環境溫度 <= CRIT"]'
     local fail_rules='["最大環境溫度 > CRIT"]'
-    local criteria="環境溫度：以代表性傳感器（Inlet/Ambient）最大值比較 IPMI SDR WARN/CRIT 門檻"
+    local criteria="環境溫度：代表性傳感器（Inlet/Ambient）最大值 ≤ WARN（\${ENV_WARN_CELSIUS}°C）為 PASS；WARN < Max ≤ CRIT（\${ENV_CRIT_CELSIUS}°C）為 WARN；Max > CRIT 為 FAIL。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2958,7 +3012,7 @@ check_bmc() {
   local pass_rules='["SEL_DAYS 視窗內 CRIT=0 且 WARN=0"]'
   local warn_rules='["SEL WARN>0 但 CRIT=0"]'
   local fail_rules='["SEL CRIT>0"]'
-  local criteria="BMC/SEL 健康：SEL 事件日誌視窗內無 CRIT/WARN 級別事件"
+  local criteria="BMC/SEL 健康：過去 \${SEL_DAYS} 天內 CRIT=0 且 WARN=0 為 PASS；有 WARN 且無 CRIT 為 WARN；有 CRIT 為 FAIL。"
 
   local jdg_json
   jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
