@@ -153,3 +153,82 @@ Refs: 2266-2324
   - ✅ Fallback 機制完善
 
   可以放心執行測試! 🎉
+
+
+
+20251011 18:30
+ 1. NIC Baseline 不會落盤問題 (server_health_full.sh:2280-2287)
+
+  問題：write_nic_baseline() 函式存在但從未被呼叫，導致 /var/tmp/nic_baseline.csv 永遠不會產生。
+
+  修正：在 check_nic() 函式結尾（set_check_result_with_jdg 之後）加上：
+
+  # 寫回 NIC baseline（供下次運行比較）
+  if [[ -n "${NIC_BASELINE_FILE:-}" ]]; then
+      write_nic_baseline
+      # 同時寫回 softnet baseline
+      if [[ -n "${SOFTNET_BASELINE_FILE:-}" ]]; then
+          printf '%s %s\n' "$SOFTNET_NOW" "$NOW_TS" > "$SOFTNET_BASELINE_FILE"
+      fi
+  fi
+
+  效果：
+  - ✅ 第一次執行會建立 /var/tmp/nic_baseline.csv 和 .softnet 檔案
+  - ✅ 每個網卡都有獨立的 timestamp entry
+  - ✅ 第二次執行會使用實際經過的秒數計算 rate（不再固定 30s）
+
+  ---
+  2. SEL 距上次事件天數不顯示問題 (server_health_full.sh:3107-3109)
+
+  問題：使用了 ${SEL_CW_EVENTS_ARRAY[-1]} 語法在 bash 中不支援（這是 zsh/bash 4.3+ 才支援的語法）。
+
+  修正：改用標準的 bash 切片語法：
+
+  # 取最後一個 event 的 datetime（使用 bash 切片語法取最後一個元素）
+  local last_event
+  last_event="${SEL_CW_EVENTS_ARRAY[@]: -1:1}"
+  last_cw_date=$(echo "$last_event" | jq -r '.datetime' 2>/dev/null || echo "")
+
+  效果：
+  - ✅ 能正確取得陣列最後一筆事件
+  - ✅ 計算 days_since_last 並附加到 final_reason
+  - ✅ PASS 時顯示：「距今已 X 天未再發」
+  - ✅ WARN/FAIL 時顯示：「最近一次 CRIT/WARN 為 X 天前」
+
+  ---
+  📋 驗證參數配置：
+
+  - ✅ line 129: NIC_BASELINE_FILE="" - 預設為空
+  - ✅ line 252: --nic-baseline) NIC_BASELINE_FILE="$2" - CLI 參數正確解析
+  - ✅ 語法檢查: bash -n 通過無錯誤
+
+  ---
+  🎯 預期執行結果：
+
+  第一次執行：
+
+  sudo rm -f /var/tmp/nic_baseline.csv*  # 清除舊檔
+  ./server_health_full.sh --nic-baseline /var/tmp/nic_baseline.csv ...
+
+  - Item 5 NIC 會顯示：Baseline initialized; counters will be compared on next run.
+  - 會產生檔案：
+    - /var/tmp/nic_baseline.csv （每個介面都有 nic,timestamp,<epoch> entry）
+    - /var/tmp/nic_baseline.csv.softnet
+
+  第二次執行 (間隔幾秒或幾分鐘後)：
+
+  ./server_health_full.sh --nic-baseline /var/tmp/nic_baseline.csv ...
+
+  - Item 5 NIC 會顯示實際的視窗時間，例如：rate=0.5/s (120s) 而非固定 (30s)
+  - Item 12 BMC/SEL 的 Reason 會出現：
+    - PASS: 過去 90 天內無 CRIT/WARN；距今已 X 天未再發
+    - FAIL: SEL CRIT=2 WARN=2 (最近一次 CRIT/WARN 為 X 天前)
+
+  ---
+  🚀 現在可以執行測試了！
+
+  建議執行步驟：
+  1. 清除舊 baseline：sudo rm -f /var/tmp/nic_baseline.csv*
+  2. 第一次執行完整腳本
+  3. 間隔 1-2 分鐘後第二次執行
+  4. 檢查輸出是否符合預期
