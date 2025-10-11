@@ -1,0 +1,4 @@
+# ip|community|label
+172.23.8.221|jfcr-ups2|UPS-RACK-A
+172.23.8.199|jfcr-ups2|UPS-RACK-B
+# 請複製為 ups_list.conf

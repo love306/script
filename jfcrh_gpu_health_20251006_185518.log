@@ -1,0 +1,10 @@
+[34m=== 系統健檢開始：20251006_185518 ===[0m
+[INFO] offline=1 ping_host=172.23.8.208 iperf=172.23.8.208 iperf_time=8
+[INFO] cpu_warn=80 cpu_crit=90 fan_th=300 sel_days=90 noise_hide=1
+[INFO] nic_baseline=/var/tmp/nic_baseline.csv output_prefix=jfcrh_gpu
+[Info] 指令存在檢查
+[警告] 缺少指令: nvme
+[34m[1] 電源供應器 (PSU)[0m
+----------------------------------------------
+[34m[2] 磁碟 / RAID / SMART[0m
+[RAID DEBUG] STORCLI_BIN='sudo /opt/MegaRAID/storcli/storcli64' RAID_STORCLI_CMD='sudo /opt/MegaRAID/storcli/storcli64'
