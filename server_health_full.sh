@@ -131,9 +131,12 @@ STORCLI_BIN="/opt/MegaRAID/storcli/storcli64"
 RAID_CONTROLLER_LIST=""   # 使用者指定 (例如: "0,1")
 
 # ---- NIC Warn thresholds (can override via env) ----
-: "${NIC_WARN_MIN_DELTA:=100}"             # 最低 Δrx_dropped
+: "${NIC_WARN_MIN_DELTA:=100}"             # 最低 Δrx_dropped（絕對值門檻）
 : "${NIC_WARN_MIN_PCT:=0.01}"              # 最低丟包百分比 (%)
 : "${NIC_WARN_MIN_RX_DROP_RATE:=0.5}"      # 最低 Δrx_dropped / sec
+: "${NIC_RATE_MIN_DELTA:=200}"             # rate/pct 觸發時需要的最小 Δ（降噪）
+: "${NIC_MIN_WINDOW_SEC:=180}"             # 最小視窗時間（秒），避免短視窗誤報（建議 120~300）
+: "${NIC_MIN_RX_PKTS:=50000}"              # 最小封包數，樣本太小不評分（建議 50000~100000）
 
 # === CONSOLIDATE START ===
 # [NEW] 整合報告相關參數
@@ -2018,12 +2021,15 @@ load_nic_baseline(){
 
 write_nic_baseline(){
   [[ -z "$NIC_BASELINE_FILE" ]] && return
-  local ts
+  local ts tmp_file
   ts=$(date +%s)
+  tmp_file="${NIC_BASELINE_FILE}.tmp.$$"
+
+  # 原子寫：先寫到暫存檔
   {
     echo "# nic,key,value (auto-generated baseline for next run, timestamp stored per-interface)"
     echo "# Baseline timestamp: $ts"
-    for nic in $(ls /sys/class/net | grep -vE 'lo|docker|veth|br-' || true); do
+    for nic in $(ls /sys/class/net 2>/dev/null | grep -vE 'lo|docker|veth|br-' || true); do
       # 為每個介面寫入一個 timestamp entry
       echo "$nic,timestamp,$ts"
       for key in rx_errors tx_errors rx_dropped tx_dropped rx_crc_errors rx_packets; do
@@ -2035,8 +2041,22 @@ write_nic_baseline(){
         fi
       done
     done
-  } > "$NIC_BASELINE_FILE"
-  echo "[NIC] Baseline updated: $NIC_BASELINE_FILE (ts=$ts)"
+  } > "$tmp_file" 2>/dev/null
+
+  # 原子替換
+  if [[ -f "$tmp_file" ]]; then
+    if mv -f "$tmp_file" "$NIC_BASELINE_FILE" 2>/dev/null; then
+      chmod 0644 "$NIC_BASELINE_FILE" 2>/dev/null
+      echo "[NIC] Baseline updated: $NIC_BASELINE_FILE (ts=$ts)"
+    else
+      echo "[NIC] ERROR: Failed to move tmp file to $NIC_BASELINE_FILE" >&2
+      rm -f "$tmp_file" 2>/dev/null
+      return 1
+    fi
+  else
+    echo "[NIC] ERROR: Failed to create tmp baseline file" >&2
+    return 1
+  fi
 }
 
 check_nic() {
@@ -2171,20 +2191,65 @@ check_nic() {
               drop_pct=$(awk -v d="$d_rx_d" -v p="$d_rx_pkts" 'BEGIN{printf "%.6f", (d/p)*100.0}')
             fi
 
-            # 判斷是否異常：只要滿足任一條件即觸發 WARN
-            local warn_hit=0
-            if ge "$d_rx_d" "$NIC_WARN_MIN_DELTA"; then warn_hit=1; fi
-            if ge "$drop_pct" "$NIC_WARN_MIN_PCT"; then warn_hit=1; fi
-            if ge "$r_rx_d" "$NIC_WARN_MIN_RX_DROP_RATE"; then warn_hit=1; fi
-            # 如果 link down 也視為異常
-            if [[ "${link_detected,,}" == "no" ]]; then warn_hit=1; fi
+            # 檢查樣本是否足夠（避免短視窗/小樣本誤報）
+            local sample_pkts=$(( d_rx_pkts + d_rx_d ))
+            local sample_ok=true
+            local sample_skip_reason=""
 
-            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct}%, rate=${r_rx_d}/s (${nic_window_sec}s), link=$link_detected"
-            if [[ "$warn_hit" == "1" ]]; then
-              final_status="WARN"
-              reason_details+=("ISSUE|$nic_summary")
+            if (( nic_window_sec < NIC_MIN_WINDOW_SEC )); then
+                sample_ok=false
+                sample_skip_reason="window=${nic_window_sec}s < ${NIC_MIN_WINDOW_SEC}s"
+            fi
+            if (( sample_pkts < NIC_MIN_RX_PKTS )); then
+                sample_ok=false
+                [[ -n "$sample_skip_reason" ]] && sample_skip_reason+=", "
+                sample_skip_reason+="pkts=${sample_pkts} < ${NIC_MIN_RX_PKTS}"
+            fi
+
+            # 判斷是否為 uplink 介面
+            local is_uplink=false
+            case ",${CABLE_UPLINK_IFACES:-}," in
+                *,"$nic",*) is_uplink=true ;;
+            esac
+
+            # 格式化數值顯示（避免過多小數）
+            local drop_pct_str r_rx_d_str
+            printf -v drop_pct_str '%.3f' "$drop_pct"
+            printf -v r_rx_d_str '%.3f' "$r_rx_d"
+
+            # 判斷是否異常：只有樣本充足時才評分
+            local warn_hit=0
+            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct_str}%, rate=${r_rx_d_str}/s (${nic_window_sec}s), link=$link_detected"
+
+            if [[ "$sample_ok" == "false" ]]; then
+                # 樣本不足，不評分（視為 OK，但記錄原因）
+                reason_details+=("SAMPLE|$nic_summary ($sample_skip_reason)")
             else
-              reason_details+=("OK|$nic_summary")
+                # 樣本充足，開始評分
+                # 新策略：降噪條件
+                # ① Δrx_dropped 超過門檻（絕對值）
+                if ge "$d_rx_d" "$NIC_WARN_MIN_DELTA"; then
+                    warn_hit=1
+                fi
+                # ② 丟包率超過門檻 AND Δ >= NIC_RATE_MIN_DELTA（需同時滿足）
+                if ge "$drop_pct" "$NIC_WARN_MIN_PCT" && ge "$d_rx_d" "$NIC_RATE_MIN_DELTA"; then
+                    warn_hit=1
+                fi
+                # ③ 丟包速率超過門檻 AND Δ >= NIC_RATE_MIN_DELTA（需同時滿足）
+                if ge "$r_rx_d" "$NIC_WARN_MIN_RX_DROP_RATE" && ge "$d_rx_d" "$NIC_RATE_MIN_DELTA"; then
+                    warn_hit=1
+                fi
+                # ④ link=no 只針對 uplink 觸發
+                if [[ "${link_detected,,}" == "no" && "$is_uplink" == "true" ]]; then
+                    warn_hit=1
+                fi
+
+                if [[ "$warn_hit" == "1" ]]; then
+                    final_status="WARN"
+                    reason_details+=("ISSUE|$nic_summary")
+                else
+                    reason_details+=("OK|$nic_summary")
+                fi
             fi
 
             local metric_json
@@ -2276,6 +2341,33 @@ check_nic() {
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
 
     set_check_result_with_jdg 5 "$final_json" "$jdg_json"
+
+    # 寫回 NIC baseline（供下次運行比較）
+    if [[ -n "${NIC_BASELINE_FILE:-}" ]]; then
+        local baseline_dir
+        baseline_dir="$(dirname "$NIC_BASELINE_FILE")"
+
+        # 確保目錄存在且可寫
+        if ! mkdir -p "$baseline_dir" 2>/dev/null; then
+            echo "[NIC] ERROR: Cannot create baseline directory: $baseline_dir" >&2
+        elif ! [[ -w "$baseline_dir" ]]; then
+            echo "[NIC] ERROR: Baseline directory not writable: $baseline_dir" >&2
+        else
+            # 呼叫 write_nic_baseline（內部已處理原子寫）
+            write_nic_baseline
+
+            # 同時寫回 softnet baseline（原子寫）
+            if [[ -n "${SOFTNET_BASELINE_FILE:-}" ]]; then
+                local softnet_tmp="${SOFTNET_BASELINE_FILE}.tmp.$$"
+                if printf '%s %s\n' "$SOFTNET_NOW" "$NOW_TS" > "$softnet_tmp" 2>/dev/null; then
+                    mv -f "$softnet_tmp" "$SOFTNET_BASELINE_FILE" && chmod 0644 "$SOFTNET_BASELINE_FILE" 2>/dev/null
+                else
+                    echo "[NIC] ERROR: Cannot write softnet baseline to $SOFTNET_BASELINE_FILE" >&2
+                    rm -f "$softnet_tmp" 2>/dev/null
+                fi
+            fi
+        fi
+    fi
 }
 
 # ----------------- 6 GPU -----------------
@@ -2317,18 +2409,26 @@ check_gpu() {
 
   if [[ "$final_status" == "SKIP" ]]; then
     # SKIP 時設為 null (中性)，渲染層不顯示 [✗]
+    # 並提供明確的 "Not applicable" 訊息
     nvidia_ok="null"
     gpu_cnt_ok="null"
+    checks_json='[{"name":"GPU installed","ok":null,"value":"N/A (no NVIDIA GPU detected)"},{"name":"nvidia-smi available","ok":null,"value":"N/A (command not found)"}]'
   elif [[ "$gpu_count" -eq 0 ]]; then
     gpu_cnt_ok="false"
+    checks_json=$(jq -n \
+      --argjson nvidia_avail "$nvidia_ok" \
+      --argjson gpu_cnt_ok "$gpu_cnt_ok" \
+      --arg gpu_cnt "$gpu_count" \
+      '[{"name":"nvidia-smi 可用","ok":$nvidia_avail,"value":($nvidia_avail|tostring)},
+        {"name":"GPU 數量","ok":$gpu_cnt_ok,"value":("count="+$gpu_cnt)}]')
+  else
+    checks_json=$(jq -n \
+      --argjson nvidia_avail "$nvidia_ok" \
+      --argjson gpu_cnt_ok "$gpu_cnt_ok" \
+      --arg gpu_cnt "$gpu_count" \
+      '[{"name":"nvidia-smi 可用","ok":$nvidia_avail,"value":($nvidia_avail|tostring)},
+        {"name":"GPU 數量","ok":$gpu_cnt_ok,"value":("count="+$gpu_cnt)}]')
   fi
-
-  checks_json=$(jq -n \
-    --argjson nvidia_avail "$nvidia_ok" \
-    --argjson gpu_cnt_ok "$gpu_cnt_ok" \
-    --arg gpu_cnt "$gpu_count" \
-    '[{"name":"nvidia-smi 可用","ok":$nvidia_avail,"value":(if $nvidia_avail==null then "N/A (not installed)" else ($nvidia_avail|tostring) end)},
-      {"name":"GPU 數量","ok":$gpu_cnt_ok,"value":("count="+$gpu_cnt)}]')
 
   local pass_rules='["nvidia-smi 存在且成功執行","至少偵測到 1 張 GPU","GPU 無 Critical Error"]'
   local warn_rules='["nvidia-smi 存在但查詢異常或偵測到溫度/功耗超出正常範圍"]'
@@ -3088,24 +3188,48 @@ check_bmc() {
   fi
 
   # 計算「已 X 天未再發」 - 直接從 SEL_CW_EVENTS_ARRAY 找最新的
-  local last_cw_ts=""
+  local last_cw_ts=0
   local days_since_last="N/A"
   local last_cw_date=""
 
   # 從已解析的 CRIT/WARN events 中找最近的 (陣列最後一個就是最新的)
   if [[ "${#SEL_CW_EVENTS_ARRAY[@]}" -gt 0 ]]; then
-    # 取最後一個 event 的 datetime
-    last_cw_date=$(echo "${SEL_CW_EVENTS_ARRAY[-1]}" | jq -r '.datetime' 2>/dev/null || echo "")
-    if [[ -n "$last_cw_date" ]]; then
-      # 嘗試轉換成 epoch (格式: MM-DD-YYYYTHH:MM:SS 或類似)
+    # 取最後一個 event 的 datetime（使用 bash 切片語法取最後一個元素）
+    local last_event
+    last_event="${SEL_CW_EVENTS_ARRAY[@]: -1:1}"
+    last_cw_date=$(echo "$last_event" | jq -r '.datetime' 2>/dev/null || echo "")
+
+    echo "[SEL] DEBUG: Found ${#SEL_CW_EVENTS_ARRAY[@]} CRIT/WARN events, last_cw_date='$last_cw_date'" >&2
+
+    if [[ -n "$last_cw_date" && "$last_cw_date" != "null" ]]; then
+      # 嘗試多種日期格式轉換
+      # 格式 1: MM-DD-YYYYTHH:MM:SS (IPMI 常見格式)
       last_cw_ts=$(date -d "${last_cw_date}" +%s 2>/dev/null || echo "0")
+
+      # 格式 2: 如果失敗，嘗試去掉 T
+      if [[ "$last_cw_ts" == "0" ]]; then
+        local clean_date="${last_cw_date//T/ }"
+        last_cw_ts=$(date -d "${clean_date}" +%s 2>/dev/null || echo "0")
+      fi
+
+      # 格式 3: 如果還是失敗，嘗試標準化 MM-DD-YYYY 為 YYYY-MM-DD
+      if [[ "$last_cw_ts" == "0" && "$last_cw_date" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})(.*)$ ]]; then
+        local normalized="${BASH_REMATCH[3]}-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[4]//T/ }"
+        last_cw_ts=$(date -d "${normalized}" +%s 2>/dev/null || echo "0")
+      fi
+
       if [[ "$last_cw_ts" -gt 0 ]]; then
         days_since_last=$(( (now_epoch - last_cw_ts) / 86400 ))
+        echo "[SEL] DEBUG: Calculated days_since_last=$days_since_last (now=$now_epoch, last=$last_cw_ts)" >&2
+      else
+        echo "[SEL] DEBUG: Failed to parse date: $last_cw_date" >&2
       fi
     fi
+  else
+    echo "[SEL] DEBUG: No CRIT/WARN events in SEL_CW_EVENTS_ARRAY" >&2
   fi
 
-  # 更新 reason
+  # 更新 reason - 根據狀態附加天數資訊
   if [[ "$days_since_last" != "N/A" && "$days_since_last" -ge 0 ]]; then
     if [[ "$final_status" == "PASS" ]]; then
       final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 ${days_since_last} 天未再發"
