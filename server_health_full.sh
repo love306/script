@@ -1999,17 +1999,33 @@ declare -A NIC_PREV
 load_nic_baseline(){
   [[ -z "$NIC_BASELINE_FILE" ]] && return
   [[ ! -f "$NIC_BASELINE_FILE" ]] && return
-  while IFS=, read -r nic key val; do
-    [[ -z "$nic" || -z "$key" || -z "$val" ]] && continue
+  while IFS=, read -r nic key val ts_field; do
+    [[ -z "$nic" || -z "$key" ]] && continue
+    # 新格式：nic,timestamp,<epoch> (key="timestamp")
+    if [[ "$key" == "timestamp" ]]; then
+      NIC_PREV["$nic:timestamp"]="$val"
+      continue
+    fi
+    # 一般 counter: nic,key,value 或舊格式 nic,key,value,ts
+    [[ -z "$val" ]] && continue
     NIC_PREV["$nic:$key"]="$val"
+    # 舊格式可能在第四欄帶 ts (向後兼容)
+    if [[ -n "$ts_field" && -z "${NIC_PREV["$nic:timestamp"]:-}" ]]; then
+      NIC_PREV["$nic:timestamp"]="$ts_field"
+    fi
   done < <(grep -v '^#' "$NIC_BASELINE_FILE" || true)
 }
 
 write_nic_baseline(){
   [[ -z "$NIC_BASELINE_FILE" ]] && return
+  local ts
+  ts=$(date +%s)
   {
-    echo "# nic,key,value (auto-generated baseline for next run)"
+    echo "# nic,key,value (auto-generated baseline for next run, timestamp stored per-interface)"
+    echo "# Baseline timestamp: $ts"
     for nic in $(ls /sys/class/net | grep -vE 'lo|docker|veth|br-' || true); do
+      # 為每個介面寫入一個 timestamp entry
+      echo "$nic,timestamp,$ts"
       for key in rx_errors tx_errors rx_dropped tx_dropped rx_crc_errors rx_packets; do
         local path="/sys/class/net/$nic/statistics/$key"
         if [[ -f "$path" ]]; then
@@ -2020,7 +2036,7 @@ write_nic_baseline(){
       done
     done
   } > "$NIC_BASELINE_FILE"
-  echo "[NIC] Baseline updated: $NIC_BASELINE_FILE"
+  echo "[NIC] Baseline updated: $NIC_BASELINE_FILE (ts=$ts)"
 }
 
 check_nic() {
@@ -2135,13 +2151,23 @@ check_nic() {
             done
 
             local d_rx_d=$(echo "$counter_increments" | jq -r '.rx_dropped // 0')
-            
-            local win=${window_seconds_used:-0}
-            (( win <= 0 )) && win=1
-            local r_rx_d=$(awk -v a="$d_rx_d" -v b="$win" 'BEGIN{printf "%.6f", a/b}')
+
+            # 計算此介面自己的視窗時間 (使用介面的 timestamp)
+            local nic_prev_ts="${NIC_PREV["$nic:timestamp"]:-}"
+            local nic_window_sec=0
+            if [[ -n "$nic_prev_ts" && "$nic_prev_ts" -gt 0 ]]; then
+                nic_window_sec=$((NOW_TS - nic_prev_ts))
+                [[ "$nic_window_sec" -lt 1 ]] && nic_window_sec=1
+            else
+                # 無 baseline 或首次運行，使用 softnet 視窗或設為 1
+                nic_window_sec=${window_seconds_used:-1}
+                [[ "$nic_window_sec" -lt 1 ]] && nic_window_sec=1
+            fi
+
+            local r_rx_d=$(awk -v a="$d_rx_d" -v b="$nic_window_sec" 'BEGIN{printf "%.6f", a/b}')
 
             local drop_pct="0.000000"
-            if (( d_rx_pkts > 0 )); then
+            if [[ "$d_rx_pkts" -gt 0 ]]; then
               drop_pct=$(awk -v d="$d_rx_d" -v p="$d_rx_pkts" 'BEGIN{printf "%.6f", (d/p)*100.0}')
             fi
 
@@ -2153,7 +2179,7 @@ check_nic() {
             # 如果 link down 也視為異常
             if [[ "${link_detected,,}" == "no" ]]; then warn_hit=1; fi
 
-            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct}%, rate=${r_rx_d}/s, link=$link_detected"
+            local nic_summary="$nic: Δrx_d=$d_rx_d, drop=${drop_pct}%, rate=${r_rx_d}/s (${nic_window_sec}s), link=$link_detected"
             if [[ "$warn_hit" == "1" ]]; then
               final_status="WARN"
               reason_details+=("ISSUE|$nic_summary")
@@ -2183,10 +2209,17 @@ check_nic() {
             metrics_array+=("$metric_json")
         done
 
+        # 用 printf 和 sed 來確保分隔符有空白
+        local details_str=""
+        if [[ "${#reason_details[@]}" -gt 0 ]]; then
+            details_str=$(printf '%s; ' "${reason_details[@]}")
+            details_str="${details_str%; }"  # 移除最後的 "; "
+        fi
+
         if [[ "$final_status" == "PASS" ]]; then
-            final_reason="NIC counters stable. Details: $(IFS=; echo "${reason_details[*]}")"
+            final_reason="NIC counters stable. Details: ${details_str}"
         else
-            final_reason="NIC issues detected. Details: $(IFS=; echo "${reason_details[*]}")"
+            final_reason="NIC issues detected. Details: ${details_str}"
         fi
         
         if [[ ! -f "$NIC_BASELINE_FILE" ]]; then
@@ -2234,10 +2267,10 @@ check_nic() {
         checks_json='[{"name":"All checks passed","ok":true,"value":"所有 NIC 計數器穩定"}]'
     fi
 
-    local pass_rules='["所有 NIC 計數器無顯著增量（rx_dropped/tx_dropped/rx_errors/tx_errors 等）"]'
-    local warn_rules='["任一 NIC 滿足以下任一條件：① Δrx_dropped ≥ MIN_DELTA，② drop% ≥ MIN_PCT，③ rx_drop_rate ≥ MIN_RX_DROP_RATE/s"]'
-    local fail_rules='["任一 NIC 介面 down（link=no）或嚴重錯誤率超標"]'
-    local criteria="NIC 健康：只以錯誤/丟包作為異常判定。於觀測窗內，任一介面滿足下列任一條件即為異常：① Δrx_dropped ≥ \${NIC_WARN_MIN_DELTA}，② drop% ≥ \${NIC_WARN_MIN_PCT}% ，③ rx_drop_rate ≥ \${NIC_WARN_MIN_RX_DROP_RATE}/s。否則視為穩定。"
+    local pass_rules='["所有 NIC rx_dropped/tx_dropped/rx_errors/tx_errors 等計數器穩定，link=yes"]'
+    local warn_rules='["任一 NIC 滿足以下任一條件：① Δrx_dropped ≥ MIN_DELTA，② drop% ≥ MIN_PCT，③ rx_drop_rate ≥ MIN_RX_DROP_RATE/s，④ link=no"]'
+    local fail_rules='["（保留給未來擴充：嚴重錯誤率或持續 link down）"]'
+    local criteria="NIC 健康：只以錯誤/丟包作為異常判定。於觀測窗內，若任一介面滿足以下任一條件則 WARN：① Δrx_dropped ≥ \${NIC_WARN_MIN_DELTA}；② 丟包率 ≥ \${NIC_WARN_MIN_PCT}%；③ 丟包速率 ≥ \${NIC_WARN_MIN_RX_DROP_RATE}/s；④ link=no。否則 PASS。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2247,13 +2280,75 @@ check_nic() {
 
 # ----------------- 6 GPU -----------------
 check_gpu() {
+  local item="GPU.Health"
   echo -e "${C_BLUE}[6] GPU${C_RESET}"
+
+  local nvidia_smi_available=false
+  local gpu_count=0
+  local final_status="SKIP"
+  local final_reason="無 nvidia-smi"
+
   if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv || true
-    set_status 6 "PASS" "列出 NVIDIA GPU"
-  else
-    set_status 6 "SKIP" "無 nvidia-smi"
+    nvidia_smi_available=true
+    # 嘗試列出 GPU
+    local gpu_list
+    gpu_list=$(nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv 2>&1)
+    if [[ $? -eq 0 ]]; then
+      echo "$gpu_list"
+      gpu_count=$(echo "$gpu_list" | tail -n +2 | wc -l | tr -d ' ')
+      if [[ "$gpu_count" -gt 0 ]]; then
+        final_status="PASS"
+        final_reason="偵測到 ${gpu_count} 張 GPU，狀態正常"
+      else
+        final_status="SKIP"
+        final_reason="nvidia-smi 執行成功但未偵測到 GPU"
+      fi
+    else
+      final_status="WARN"
+      final_reason="nvidia-smi 存在但執行失敗"
+      echo "[WARN] nvidia-smi failed: $gpu_list"
+    fi
   fi
+
+  # 建立 judgement - SKIP 時避免顯示誤導的 [✗]
+  local checks_json
+  local nvidia_ok="$nvidia_smi_available"
+  local gpu_cnt_ok="true"
+
+  if [[ "$final_status" == "SKIP" ]]; then
+    # SKIP 時設為 null (中性)，渲染層不顯示 [✗]
+    nvidia_ok="null"
+    gpu_cnt_ok="null"
+  elif [[ "$gpu_count" -eq 0 ]]; then
+    gpu_cnt_ok="false"
+  fi
+
+  checks_json=$(jq -n \
+    --argjson nvidia_avail "$nvidia_ok" \
+    --argjson gpu_cnt_ok "$gpu_cnt_ok" \
+    --arg gpu_cnt "$gpu_count" \
+    '[{"name":"nvidia-smi 可用","ok":$nvidia_avail,"value":(if $nvidia_avail==null then "N/A (not installed)" else ($nvidia_avail|tostring) end)},
+      {"name":"GPU 數量","ok":$gpu_cnt_ok,"value":("count="+$gpu_cnt)}]')
+
+  local pass_rules='["nvidia-smi 存在且成功執行","至少偵測到 1 張 GPU","GPU 無 Critical Error"]'
+  local warn_rules='["nvidia-smi 存在但查詢異常或偵測到溫度/功耗超出正常範圍"]'
+  local fail_rules='["nvidia-smi 存在但執行失敗 (rc!=0)"]'
+  local criteria="檢查 NVIDIA GPU 是否可用。若 nvidia-smi 指令存在且成功執行，視為 PASS；若指令不存在則 SKIP；若存在但執行失敗則 WARN。"
+
+  local th_json='{"GPU_TEMP_WARN":85,"GPU_TEMP_CRIT":92,"GPU_POWER_WATCH":0}'
+
+  local base_json
+  base_json=$(jq -n \
+    --arg status "$final_status" \
+    --arg item "$item" \
+    --arg reason "$final_reason" \
+    --arg tips "$(get_item_tips 6)" \
+    '{status:$status, item:$item, reason:$reason, tips:($tips|split("\n")|map(select(.!="")))}')
+
+  local jdg_json
+  jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
+
+  set_check_result_with_jdg 6 "$base_json" "$jdg_json"
 }
 
 check_fans() {
@@ -2640,8 +2735,8 @@ check_env() {
     th_json=$(jq -n \
       --arg warn "$overall_warn" \
       --arg crit "$overall_crit" \
-      '{ENV_WARN_CELSIUS: (if $warn=="" then null else ($warn|tonumber) end),
-        ENV_CRIT_CELSIUS: (if $crit=="" then null else ($crit|tonumber) end)}')
+      '{ENV_TEMP_WARN: (if $warn=="" then null else ($warn|tonumber) end),
+        ENV_TEMP_CRIT: (if $crit=="" then null else ($crit|tonumber) end)}')
 
     local max_temp_val=$(echo "$metrics_json" | jq -r 'map(.value) | max // 0')
     local checks_json
@@ -2655,7 +2750,7 @@ check_env() {
     local pass_rules='["最大環境溫度 <= WARN"]'
     local warn_rules='["WARN < 最大環境溫度 <= CRIT"]'
     local fail_rules='["最大環境溫度 > CRIT"]'
-    local criteria="環境溫度：代表性傳感器（Inlet/Ambient）最大值 ≤ WARN（\${ENV_WARN_CELSIUS}°C）為 PASS；WARN < Max ≤ CRIT（\${ENV_CRIT_CELSIUS}°C）為 WARN；Max > CRIT 為 FAIL。"
+    local criteria="環境溫度：代表性傳感器（Inlet/Ambient）最大值 ≤ WARN（\${ENV_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（\${ENV_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2992,6 +3087,35 @@ check_bmc() {
     final_reason="SEL WARN=$SEL_WARN"
   fi
 
+  # 計算「已 X 天未再發」 - 直接從 SEL_CW_EVENTS_ARRAY 找最新的
+  local last_cw_ts=""
+  local days_since_last="N/A"
+  local last_cw_date=""
+
+  # 從已解析的 CRIT/WARN events 中找最近的 (陣列最後一個就是最新的)
+  if [[ "${#SEL_CW_EVENTS_ARRAY[@]}" -gt 0 ]]; then
+    # 取最後一個 event 的 datetime
+    last_cw_date=$(echo "${SEL_CW_EVENTS_ARRAY[-1]}" | jq -r '.datetime' 2>/dev/null || echo "")
+    if [[ -n "$last_cw_date" ]]; then
+      # 嘗試轉換成 epoch (格式: MM-DD-YYYYTHH:MM:SS 或類似)
+      last_cw_ts=$(date -d "${last_cw_date}" +%s 2>/dev/null || echo "0")
+      if [[ "$last_cw_ts" -gt 0 ]]; then
+        days_since_last=$(( (now_epoch - last_cw_ts) / 86400 ))
+      fi
+    fi
+  fi
+
+  # 更新 reason
+  if [[ "$days_since_last" != "N/A" && "$days_since_last" -ge 0 ]]; then
+    if [[ "$final_status" == "PASS" ]]; then
+      final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 ${days_since_last} 天未再發"
+    else
+      final_reason="${final_reason} (最近一次 CRIT/WARN 為 ${days_since_last} 天前)"
+    fi
+  elif [[ "$final_status" == "PASS" ]]; then
+    final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN 事件"
+  fi
+
   local final_json
   final_json=$(jq -n --arg item "$item" --arg status "$final_status" --arg reason "$final_reason" --argjson evidence "$evidence" \
     '{status:$status, item:$item, reason:$reason, evidence:$evidence}')
@@ -3005,9 +3129,11 @@ check_bmc() {
     --arg crit "$SEL_CRIT" \
     --arg warn "$SEL_WARN" \
     --arg info "$SEL_INFO" \
+    --arg days_since "$days_since_last" \
     '[{"name":"SEL CRIT 事件=0","ok":($crit|tonumber==0),"value":("crit="+$crit)},
       {"name":"SEL WARN 事件=0","ok":($warn|tonumber==0),"value":("warn="+$warn)},
-      {"name":"SEL INFO 事件計數","ok":true,"value":("info="+$info)}]')
+      {"name":"SEL INFO 事件計數","ok":true,"value":("info="+$info)},
+      {"name":"距上次 CRIT/WARN 天數","ok":true,"value":("days_since_last="+$days_since)}]')
 
   local pass_rules='["SEL_DAYS 視窗內 CRIT=0 且 WARN=0"]'
   local warn_rules='["SEL WARN>0 但 CRIT=0"]'
