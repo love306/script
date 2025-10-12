@@ -1459,206 +1459,694 @@ check_disks() {
     local item="Disks.RAID.SMART"
     echo -e "${C_BLUE}[2] 磁碟 / RAID / SMART${C_RESET}"
 
-    # --- Sudo pre-check ---
-    if ! sudo -n true 2>/dev/null; then
-        local reason="無法免密碼執行 sudo，跳過 SMART/NVMe 詳細檢查。"
+    : "${SMART_REQUIRED:=true}"
+    : "${NVME_REQUIRED:=true}"
+    : "${ROOT_REQUIRED:=true}"
+    : "${DISK_REBUILD_WARN:=1}"
+    : "${PD_FAIL_CRIT:=1}"
+    : "${VD_DEGRADED_WARN:=1}"
+    : "${SMART_ALERT_FAIL_CRIT:=1}"
+    : "${SMART_REALLOC_WARN:=1}"
+    : "${SMART_PENDING_WARN:=1}"
+    : "${NVME_CRIT_WARN_CRIT:=1}"
+    : "${NVME_MEDIA_ERR_WARN:=1}"
+    : "${NVME_PCT_USED_WARN:=80}"
 
-        # 建立 base JSON
-        local base_json
-        base_json=$(jq -n \
-          --arg status "WARN" \
-          --arg item "$item" \
-          --arg reason "$reason" \
-          --arg tips "$(get_item_tips 2)" \
-          '{status:$status, item:$item, reason:$reason, tips:($tips|split("\n")|map(select(.!="")))}')
+    local tips_text="$(get_item_tips 2)"
 
-        # 判斷基準
-        local pass_rules='["RAID 控制器/VD/PD 皆正常","SMART/NVMe 健康 OK"]'
-        local warn_rules='["RAID 正常但 SMART/NVMe 因權限/工具缺失而跳過"]'
-        local fail_rules='["RAID 降級/故障或 SMART/NVMe 顯示故障/預警"]'
+    local disk_dir="$LOG_DIR/disks"
+    mkdir -p "$disk_dir"
+    local metrics_path="${disk_dir}/metrics_${TIMESTAMP}.json"
+    local smart_log=""
+    local nvme_log=""
+    local mdstat_log=""
+    local storcli_summary_path=""
 
-        # 蒐集能拿到的事證（工具可用性、是否 root、storcli/nvme/smartctl）
-        local can_storcli=false; command -v ${STORCLI_BIN%% *} >/dev/null 2>&1 && can_storcli=true
-        local can_smart=false;   command -v smartctl >/dev/null 2>&1 && can_smart=true
-        local can_nvme=false;    command -v nvme >/dev/null 2>&1 && can_nvme=true
-        local is_root=false;     [[ "$(id -u)" == "0" ]] && is_root=true
+    local smart_required_flag=0
+    case "${SMART_REQUIRED,,}" in
+        true|1|yes) smart_required_flag=1;;
+    esac
+    local nvme_required_flag=0
+    case "${NVME_REQUIRED,,}" in
+        true|1|yes) nvme_required_flag=1;;
+    esac
+    local root_required_flag=0
+    case "${ROOT_REQUIRED,,}" in
+        true|1|yes) root_required_flag=1;;
+    esac
 
-        local checks_json
-        checks_json=$(jq -n \
-          --argjson stor "$can_storcli" \
-          --argjson smt  "$can_smart" \
-          --argjson nvm  "$can_nvme" \
-          --argjson root "$is_root" \
-          '[
-            {"name":"storcli 可用","ok":$stor,"value":($stor|tostring)},
-            {"name":"smartctl 可用","ok":$smt,"value":($smt|tostring)},
-            {"name":"nvme 可用","ok":$nvm,"value":($nvm|tostring)},
-            {"name":"root 權限","ok":$root,"value":($root|tostring)}
-          ]')
-
-        local th_json='{"SMART_REQUIRED":true,"NVME_REQUIRED":true,"ROOT_REQUIRED":true}'
-
-        local criteria="磁碟健康：RAID/SMART/NVMe 檢查。無 root/免密碼時以 RAID 結果為主，SMART/NVMe 註記為跳過（WARN）。"
-        local jdg_json
-        jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
-
-        set_check_result_with_jdg 2 "$base_json" "$jdg_json"
-        collect_raid_megaraid
-        return
+    local is_root=0
+    [[ "$(id -u)" -eq 0 ]] && is_root=1
+    local has_sudo=0
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo -n true 2>/dev/null; then
+            has_sudo=1
+        fi
+    fi
+    local -a sudo_prefix=()
+    if (( is_root )); then
+        sudo_prefix=()
+    elif (( has_sudo )); then
+        sudo_prefix=(sudo -n)
+    fi
+    local root_access=0
+    if (( is_root || has_sudo )); then
+        root_access=1
     fi
 
-    # --- Refactored Logic --- 
     lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,MOUNTPOINT || true
-    
-    local smart_results_json="[]"
-    local nvme_results_json="[]"
-    local overall_status="PASS"
-    local reason_details=()
 
-    # --- SMART (HDD/SSD) Check ---
-    for d in /dev/sd?; do
-        [[ -b "$d" ]] || continue
-        echo "== $d =="
-        local smart_output
-        smart_output=$(sudo smartctl -A -H "$d" 2>/dev/null)
-        if [[ -z "$smart_output" ]]; then continue; fi
+    RAID_STATUS_IMPACT=""
+    RAID_SUMMARY_JSON="{}"
+    RAID_REBUILD_PRESENT=0
 
-        local health_status="PASS"
-        if echo "$smart_output" | grep -qi 'FAILED'; then
-            health_status="FAIL"
-        elif echo "$smart_output" | grep -qi 'pre-fail'; then
-            health_status="WARN"
+    local raid_summary_raw=""
+    local raid_driver="none"
+    local raid_controllers_json="[]"
+    local vd_total=0
+    local vd_degraded=0
+    local vd_failed=0
+    local vd_rebuild=0
+    local pd_failed=0
+    local pd_missing=0
+    local mdadm_arrays_found=0
+    local mdadm_degraded=0
+    local mdadm_recovering=0
+    local mdadm_arrays_json="[]"
+
+    local -a mdadm_arrays_entries=()
+    local -a smart_devices_entries=()
+    local -a smart_failed_list=()
+    local -a smart_realloc_list=()
+    local -a smart_pending_list=()
+    local -a smart_uncorr_list=()
+    local -a nvme_devices_entries=()
+    local -a nvme_cw_list=()
+    local -a nvme_media_err_list=()
+    local -a nvme_pct80_list=()
+    local -a warn_reasons=()
+    local -a fail_reasons=()
+
+    local smart_scanned=1
+    local smart_reason=""
+    local nvme_scanned=1
+    local nvme_reason=""
+    local storcli_scanned=0
+    local storcli_reason=""
+
+    local storcli_available=0
+    local storcli_cmd="${RAID_STORCLI_CMD:-$STORCLI_BIN}"
+    local storcli_bin="${storcli_cmd#sudo }"
+    storcli_bin="${storcli_bin%% *}"
+    if [[ -n "$storcli_bin" ]] && { command -v "$storcli_bin" >/dev/null 2>&1 || [[ -x "$storcli_bin" ]]; }; then
+        storcli_available=1
+    fi
+    local smartctl_available=0
+    command -v smartctl >/dev/null 2>&1 && smartctl_available=1
+    local nvme_available=0
+    command -v nvme >/dev/null 2>&1 && nvme_available=1
+
+    if (( storcli_available )) && (( root_access )); then
+        collect_raid_megaraid
+        if [[ -f "$RAID_TMP_DIR/raid_summary.json" ]]; then
+            raid_summary_raw=$(cat "$RAID_TMP_DIR/raid_summary.json")
+        else
+            raid_summary_raw=$RAID_SUMMARY_JSON
         fi
-
-        local reallocated; reallocated=$(echo "$smart_output" | awk '/Reallocated_Sector_Ct/ {print $10}'); [[ -z "$reallocated" ]] && reallocated=0
-        local pending; pending=$(echo "$smart_output" | awk '/Current_Pending_Sector/ {print $10}'); [[ -z "$pending" ]] && pending=0
-        local power_on; power_on=$(echo "$smart_output" | awk '/Power_On_Hours/ {print $10}'); [[ -z "$power_on" ]] && power_on=0
-
-        if (( reallocated > 0 || pending > 0 )); then
-            health_status="WARN"
-        fi
-
-        if [[ "$health_status" != "PASS" ]]; then
-            reason_details+=("$d is $health_status (Reallocated:$reallocated, Pending:$pending)")
-            if [[ "$health_status" == "FAIL" ]]; then overall_status="FAIL"; fi
-            if [[ "$health_status" == "WARN" && "$overall_status" != "FAIL" ]]; then overall_status="WARN"; fi
-        fi
-
-        local disk_json=$(jq -n --arg dev "$d" --arg status "$health_status" --argjson re "$reallocated" --argjson pend "$pending" --argjson poh "$power_on" \
-            '{device:$dev, status:$status, attributes:{reallocated_sectors:$re, pending_sectors:$pend, power_on_hours:$poh} }')
-        smart_results_json=$(echo "$smart_results_json" | jq ". + [$disk_json]")
-    done
-
-    # --- NVMe Check ---
-    if command -v nvme >/dev/null 2>&1; then
-        for n in /dev/nvme?n1; do
-            [[ -c "$n" ]] || continue # NVMe devices are char devices
-            echo "== $n (nvme smart-log) =="
-            local nvme_output
-            nvme_output=$(sudo nvme smart-log "$n" 2>/dev/null)
-            if [[ -z "$nvme_output" ]]; then continue; fi
-
-            local crit_warn=$(echo "$nvme_output" | grep -i 'critical_warning' | awk -F: '{print $2}' | xargs)
-            local temp=$(echo "$nvme_output" | grep -i 'temperature' | awk -F: '{print $2}' | xargs)
-            local media_err=$(echo "$nvme_output" | grep -i 'media_errors' | awk -F: '{print $2}' | xargs)
-
-            local nvme_status="PASS"
-            if [[ "$crit_warn" != "0" ]]; then
-                nvme_status="FAIL"
-                reason_details+=("$n has critical_warning: $crit_warn")
-                overall_status="FAIL"
-            elif (( media_err > 0 )); then
-                nvme_status="WARN"
-                if [[ "$overall_status" != "FAIL" ]]; then overall_status="WARN"; fi
-                reason_details+=("$n has media_errors: $media_err")
+        if [[ -n "$raid_summary_raw" && "$raid_summary_raw" != "{}" ]]; then
+            raid_controllers_json=$(echo "$raid_summary_raw" | jq -c '
+                try (.controllers // []) | map({
+                    id: ("c" + (.controller|tostring)),
+                    model: (.model // ""),
+                    virtual_drives: {
+                        total: (.vd.total // 0),
+                        optimal: ((.vd.total // 0) - (.vd.degraded // 0) - (.vd.failed // 0)),
+                        degraded: (.vd.degraded // 0),
+                        failed: (.vd.failed // 0),
+                        rebuild: (if (.ops // {} | (has("rebuild_pct") or has("init_pct"))) then 1 else 0 end)
+                    },
+                    physical_disks: {
+                        total: (.pd.total // 0),
+                        online: ((.pd.total // 0) - (.pd.failed // 0) - (.pd.missing // 0)),
+                        failed: (.pd.failed // 0),
+                        missing: (.pd.missing // 0),
+                        foreign: 0,
+                        pred_fail: (.pd.predictive // 0)
+                    }
+                }) catch []')
+            if [[ -n "$raid_controllers_json" && "$raid_controllers_json" != "[]" ]]; then
+                storcli_scanned=1
+                raid_driver="storcli"
+                storcli_summary_path="${disk_dir}/storcli_summary_${TIMESTAMP}.json"
+                printf '%s\n' "$raid_summary_raw" > "$storcli_summary_path"
+                vd_total=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_total // 0)' 2>/dev/null)
+                [[ -z "$vd_total" ]] && vd_total=0
+                vd_degraded=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_degraded // 0)' 2>/dev/null)
+                [[ -z "$vd_degraded" ]] && vd_degraded=0
+                vd_failed=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_failed // 0)' 2>/dev/null)
+                [[ -z "$vd_failed" ]] && vd_failed=0
+                pd_failed=$(echo "$raid_summary_raw" | jq -r '(.agg.pd_failed // 0)' 2>/dev/null)
+                [[ -z "$pd_failed" ]] && pd_failed=0
+                pd_missing=$(echo "$raid_summary_raw" | jq -r '(.agg.pd_missing // 0)' 2>/dev/null)
+                [[ -z "$pd_missing" ]] && pd_missing=0
+                vd_rebuild=$(echo "$raid_summary_raw" | jq -r '((.controllers // []) | map((.ops // {}) | (if ((.rebuild_pct // "") != "" or (.init_pct // "") != "") then 1 else 0 end)) | add) // 0' 2>/dev/null)
+                [[ -z "$vd_rebuild" ]] && vd_rebuild=0
+            else
+                storcli_reason="no_controllers"
             fi
+        else
+            storcli_reason="no_data"
+        fi
+    else
+        if (( storcli_available == 0 )); then
+            storcli_reason="not_found"
+        elif (( root_access == 0 )); then
+            storcli_reason="root_required"
+        else
+            storcli_reason="not_supported"
+        fi
+    fi
 
-            local nvme_disk_json=$(jq -n --arg dev "$n" --arg status "$nvme_status" --argjson cw "$crit_warn" --arg temp "$temp" --argjson me "$media_err" \
-                '{device:$dev, status:$status, attributes:{critical_warning:$cw, temperature_celsius:$temp, media_errors:$me} }')
-            nvme_results_json=$(echo "$nvme_results_json" | jq ". + [$nvme_disk_json]")
+    if [[ -r /proc/mdstat ]]; then
+        mdstat_log="${disk_dir}/mdstat_${TIMESTAMP}.log"
+        cat /proc/mdstat > "$mdstat_log"
+        local current_name=""
+        local current_level=""
+        local current_state=""
+        local current_recovery=""
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ $line =~ ^(md[0-9]+) ]]; then
+                if [[ -n "$current_name" ]]; then
+                    local rec_clean="${current_recovery%%%}"
+                    mdadm_arrays_entries+=("$(jq -n --arg name "$current_name" --arg level "$current_level" --arg state "$current_state" --arg rec "$rec_clean" '{name:$name, level:$level, state:$state, recovery_pct:(if $rec=="" then null else $rec end)}')")
+                    case "$current_state" in
+                        degraded) ((mdadm_degraded++));;
+                        recovering) ((mdadm_recovering++));;
+                    esac
+                fi
+                current_name="${BASH_REMATCH[1]}"
+                mdadm_arrays_found=1
+                current_level=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^raid[0-9]+$/){print $i; break}}}')
+                [[ -z "$current_level" ]] && current_level="unknown"
+                current_state="clean"
+                if echo "$line" | grep -Eq '\[[^]]*_[^]]*\]'; then
+                    current_state="degraded"
+                fi
+                if echo "$line" | grep -qi 'inactive'; then
+                    current_state="degraded"
+                fi
+                current_recovery=""
+            elif [[ -n "$current_name" ]]; then
+                if echo "$line" | grep -Eq '(resync|recovery|rebuild)'; then
+                    current_state="recovering"
+                    current_recovery=$(echo "$line" | grep -Eo '[0-9]+(\.[0-9]+)?%' | head -n1)
+                fi
+            fi
+        done < /proc/mdstat
+        if [[ -n "$current_name" ]]; then
+            local rec_clean="${current_recovery%%%}"
+            mdadm_arrays_entries+=("$(jq -n --arg name "$current_name" --arg level "$current_level" --arg state "$current_state" --arg rec "$rec_clean" '{name:$name, level:$level, state:$state, recovery_pct:(if $rec=="" then null else $rec end)}')")
+            case "$current_state" in
+                degraded) ((mdadm_degraded++));;
+                recovering) ((mdadm_recovering++));;
+            esac
+        fi
+    fi
+    if (( mdadm_arrays_found )); then
+        mdadm_arrays_json=$(printf '%s\n' "${mdadm_arrays_entries[@]}" | jq -s '.')
+        if [[ "$raid_driver" == "none" ]]; then
+            raid_driver="mdadm"
+        fi
+    fi
+
+    if (( smartctl_available == 0 )); then
+        smart_scanned=0
+        smart_reason="tool_missing"
+    elif (( smart_required_flag )) && (( root_access == 0 )); then
+        smart_scanned=0
+        smart_reason="root_required"
+    fi
+
+    local -a SMART_CMD=()
+    if (( smartctl_available )); then
+        SMART_CMD=("${sudo_prefix[@]}" smartctl)
+    fi
+    if (( smart_scanned )); then
+        local -a smart_disks=()
+        while read -r name type; do
+            if [[ "$type" == "disk" ]]; then
+                smart_disks+=("/dev/$name")
+            fi
+        done < <(lsblk -ndo NAME,TYPE 2>/dev/null)
+        for disk in "${smart_disks[@]}"; do
+            echo "[SMART] $disk"
+            local smart_output
+            smart_output=$("${SMART_CMD[@]}" -i -H -A "$disk" 2>&1)
+            local rc=$?
+            if [[ -z "$smart_output" ]]; then
+                smart_reason="command_failed"
+                continue
+            fi
+            if [[ -z "$smart_log" ]]; then
+                smart_log="${disk_dir}/smart_scan_${TIMESTAMP}.log"
+                : > "$smart_log"
+            fi
+            {
+                echo "==== $disk ===="
+                echo "$smart_output"
+                echo
+            } >> "$smart_log"
+            if (( rc != 0 )) && [[ -z "$smart_reason" ]]; then
+                smart_reason="command_exit_${rc}"
+            fi
+            local model
+            model=$(echo "$smart_output" | awk -F: '/Device Model|Model Number|Product/ {print $2; exit}' | xargs)
+            local overall
+            overall=$(echo "$smart_output" | awk -F: '/SMART overall-health self-assessment test result/ {print $2}' | xargs)
+            [[ -z "$overall" ]] && overall="UNKNOWN"
+            overall=${overall^^}
+            local reallocated
+            reallocated=$(echo "$smart_output" | awk '/Reallocated_Sector_Ct/ {print $10}' | tail -n1)
+            [[ "$reallocated" =~ ^[0-9]+$ ]] || reallocated=0
+            local pending
+            pending=$(echo "$smart_output" | awk '/Current_Pending_Sector/ {print $10}' | tail -n1)
+            [[ "$pending" =~ ^[0-9]+$ ]] || pending=0
+            local uncorrect
+            uncorrect=$(echo "$smart_output" | awk '/Offline_Uncorrectable/ {print $10}' | tail -n1)
+            [[ "$uncorrect" =~ ^[0-9]+$ ]] || uncorrect=0
+            local poh
+            poh=$(echo "$smart_output" | awk '/Power_On_Hours/ {print $10}' | tail -n1)
+            [[ "$poh" =~ ^[0-9]+$ ]] || poh=0
+            local temperature
+            temperature=$(echo "$smart_output" | awk '/Temperature_Celsius/ {print $10}' | tail -n1)
+            local temperature_json="null"
+            if [[ "$temperature" =~ ^-?[0-9]+$ ]]; then
+                temperature_json=$temperature
+            fi
+            smart_devices_entries+=("$(jq -n --arg dev "$disk" --arg model "$model" --arg status "$overall" --argjson realloc $reallocated --argjson pending $pending --argjson uncorr $uncorrect --argjson temp $temperature_json --argjson poh $poh '{dev:$dev, model:$model, status:$status, realloc:$realloc, pending:$pending, uncorrect:$uncorr, temp:(if $temp==null then null else $temp end), poh:$poh}')")
+            if [[ "$overall" == "FAILED" ]]; then
+                smart_failed_list+=("$disk")
+            fi
+            if (( reallocated > 0 )); then
+                smart_realloc_list+=("$disk")
+            fi
+            if (( pending > 0 )); then
+                smart_pending_list+=("$disk")
+            fi
+            if (( uncorrect > 0 )); then
+                smart_uncorr_list+=("$disk")
+            fi
         done
     fi
 
-    # --- Software RAID Check ---
-    local mdstat_status="NA" mdstat_reason=""
-    local mdstat_json="null"
-    if [[ -r /proc/mdstat ]]; then
-        mdstat_status="PASS"
-        mdstat_reason="mdadm status is clean."
-        if grep -q 'degraded' /proc/mdstat; then
-            mdstat_status="FAIL"; mdstat_reason="mdadm array is DEGRADED."
-            overall_status="FAIL"
-        elif grep -q 'resync' /proc/mdstat; then
-            mdstat_status="WARN"; mdstat_reason="mdadm array is resyncing."
-            if [[ "$overall_status" != "FAIL" ]]; then overall_status="WARN"; fi
+    if (( nvme_available == 0 )); then
+        nvme_scanned=0
+        nvme_reason="tool_missing"
+    elif (( nvme_required_flag )) && (( root_access == 0 )); then
+        nvme_scanned=0
+        nvme_reason="root_required"
+    fi
+
+    local -a NVME_CMD=()
+    if (( nvme_available )); then
+        NVME_CMD=("${sudo_prefix[@]}" nvme)
+    fi
+    if (( nvme_scanned )); then
+        local nvme_list_json
+        nvme_list_json=$("${NVME_CMD[@]}" list -o json 2>/dev/null)
+        if [[ -z "$nvme_list_json" ]]; then
+            nvme_scanned=0
+            nvme_reason="command_failed"
+        else
+            mapfile -t nvme_paths < <(echo "$nvme_list_json" | jq -r '.Devices[]?.DevicePath // empty')
+            for dev in "${nvme_paths[@]}"; do
+                echo "[NVMe] $dev"
+                local model
+                model=$(echo "$nvme_list_json" | jq -r ".Devices[] | select(.DevicePath==\"$dev\") | .ModelNumber // \"\"" 2>/dev/null)
+                local smart_json
+                smart_json=$("${NVME_CMD[@]}" smart-log -o json "$dev" 2>/dev/null)
+                if [[ -z "$smart_json" ]]; then
+                    nvme_reason="smart_log_failed"
+                    continue
+                fi
+                if [[ -z "$nvme_log" ]]; then
+                    nvme_log="${disk_dir}/nvme_smart_${TIMESTAMP}.log"
+                    : > "$nvme_log"
+                fi
+                {
+                    echo "==== $dev ===="
+                    echo "$smart_json"
+                    echo
+                } >> "$nvme_log"
+                local crit_warn
+                crit_warn=$(echo "$smart_json" | jq -r '(.critical_warning // 0)' 2>/dev/null)
+                [[ "$crit_warn" =~ ^[0-9]+$ ]] || crit_warn=0
+                local media_err
+                media_err=$(echo "$smart_json" | jq -r '(.media_errors // 0)' 2>/dev/null)
+                [[ "$media_err" =~ ^[0-9]+$ ]] || media_err=0
+                local err_log
+                err_log=$(echo "$smart_json" | jq -r '(.num_err_log_entries // 0)' 2>/dev/null)
+                [[ "$err_log" =~ ^[0-9]+$ ]] || err_log=0
+                local temperature_k
+                temperature_k=$(echo "$smart_json" | jq -r '(.temperature // 0)' 2>/dev/null)
+                [[ "$temperature_k" =~ ^[0-9]+$ ]] || temperature_k=0
+                local temperature_json="null"
+                if [[ "$temperature_k" =~ ^[0-9]+$ && $temperature_k -gt 0 ]]; then
+                    local temperature_c=$(( temperature_k - 273 ))
+                    temperature_json=$temperature_c
+                fi
+                local pct_used
+                pct_used=$(echo "$smart_json" | jq -r '(.percentage_used // 0)' 2>/dev/null)
+                [[ "$pct_used" =~ ^[0-9]+$ ]] || pct_used=0
+                nvme_devices_entries+=("$(jq -n --arg dev "$dev" --arg model "$model" --argjson crit $crit_warn --argjson media $media_err --argjson err $err_log --argjson temp $temperature_json --argjson pct $pct_used '{dev:$dev, model:$model, crit_warn:$crit, media_err:$media, err_log:$err, temp:(if $temp==null then null else $temp end), pct_used:$pct}')")
+                if (( crit_warn > 0 )); then
+                    nvme_cw_list+=("$dev")
+                fi
+                if (( media_err > 0 )); then
+                    nvme_media_err_list+=("$dev")
+                fi
+                if (( pct_used >= NVME_PCT_USED_WARN )); then
+                    nvme_pct80_list+=("$dev")
+                fi
+            done
         fi
-        mdstat_json=$(jq -n --arg status "$mdstat_status" --arg reason "$mdstat_reason" '{status:$status, reason:$reason}')
     fi
 
-    # --- Hardware RAID Check ---
-    collect_raid_megaraid
-    local raid_status=$(echo "$RAID_SUMMARY_JSON" | jq -r .overall 2>/dev/null || echo "SKIP")
-    if [[ "$raid_status" == "FAIL" ]]; then
-        overall_status="FAIL"
-        reason_details+=("Hardware RAID status is FAIL.")
-    elif [[ "$raid_status" == "WARN" && "$overall_status" != "FAIL" ]]; then
-        overall_status="WARN"
-        reason_details+=("Hardware RAID status is WARN.")
+    local smart_devices_json="[]"
+    if (( ${#smart_devices_entries[@]} > 0 )); then
+        smart_devices_json=$(printf '%s\n' "${smart_devices_entries[@]}" | jq -s '.')
+    fi
+    local smart_failed_json='[]'
+    if (( ${#smart_failed_list[@]} > 0 )); then
+        smart_failed_json=$(printf '%s\n' "${smart_failed_list[@]}" | jq -R . | jq -s '.')
+    fi
+    local smart_realloc_json='[]'
+    if (( ${#smart_realloc_list[@]} > 0 )); then
+        smart_realloc_json=$(printf '%s\n' "${smart_realloc_list[@]}" | jq -R . | jq -s '.')
+    fi
+    local smart_pending_json='[]'
+    if (( ${#smart_pending_list[@]} > 0 )); then
+        smart_pending_json=$(printf '%s\n' "${smart_pending_list[@]}" | jq -R . | jq -s '.')
+    fi
+    local smart_uncorr_json='[]'
+    if (( ${#smart_uncorr_list[@]} > 0 )); then
+        smart_uncorr_json=$(printf '%s\n' "${smart_uncorr_list[@]}" | jq -R . | jq -s '.')
     fi
 
-    # --- Final Aggregation ---
+    local nvme_devices_json="[]"
+    if (( ${#nvme_devices_entries[@]} > 0 )); then
+        nvme_devices_json=$(printf '%s\n' "${nvme_devices_entries[@]}" | jq -s '.')
+    fi
+    local nvme_cw_json='[]'
+    if (( ${#nvme_cw_list[@]} > 0 )); then
+        nvme_cw_json=$(printf '%s\n' "${nvme_cw_list[@]}" | jq -R . | jq -s '.')
+    fi
+    local nvme_media_err_json='[]'
+    if (( ${#nvme_media_err_list[@]} > 0 )); then
+        nvme_media_err_json=$(printf '%s\n' "${nvme_media_err_list[@]}" | jq -R . | jq -s '.')
+    fi
+    local nvme_pct80_json='[]'
+    if (( ${#nvme_pct80_list[@]} > 0 )); then
+        nvme_pct80_json=$(printf '%s\n' "${nvme_pct80_list[@]}" | jq -R . | jq -s '.')
+    fi
+
+    local smart_failed_count=${#smart_failed_list[@]}
+    local smart_realloc_count=${#smart_realloc_list[@]}
+    local smart_pending_count=${#smart_pending_list[@]}
+    local smart_uncorr_count=${#smart_uncorr_list[@]}
+    local nvme_cw_count=${#nvme_cw_list[@]}
+    local nvme_media_err_count=${#nvme_media_err_list[@]}
+    local nvme_pct80_count=${#nvme_pct80_list[@]}
+    local mdadm_issue_count=$((mdadm_degraded + mdadm_recovering))
+
+    if (( smartctl_available == 0 )); then
+        tips_text+=$'\n安裝 smartmontools: apt install smartmontools'
+    fi
+    if (( nvme_available == 0 )); then
+        tips_text+=$'\n安裝 nvme-cli: apt install nvme-cli'
+    fi
+    if (( storcli_available == 0 )); then
+        tips_text+=$'\n如需檢查硬體 RAID，請安裝 storcli (MegaRAID 工具)'
+    fi
+
+    local raid_metrics_json
+    raid_metrics_json=$(jq -n --arg driver "$raid_driver" --argjson controllers "$raid_controllers_json" --argjson arrays "$mdadm_arrays_json" '{driver:$driver, controllers:$controllers, mdadm:{arrays:$arrays}}')
+    local smart_scanned_json=$([[ $smart_scanned -eq 1 ]] && echo true || echo false)
+    local nvme_scanned_json=$([[ $nvme_scanned -eq 1 ]] && echo true || echo false)
+    local smart_metrics_json
+    smart_metrics_json=$(jq -n --argjson scanned $smart_scanned_json --argjson devices "$smart_devices_json" --argjson failed "$smart_failed_json" --argjson realloc "$smart_realloc_json" --argjson pending "$smart_pending_json" --argjson uncorr "$smart_uncorr_json" '{scanned:$scanned, devices:$devices, alerts:{failed:$failed, realloc_gt0:$realloc, pending_gt0:$pending, uncorr_gt0:$uncorr}}')
+    local nvme_metrics_json
+    nvme_metrics_json=$(jq -n --argjson scanned $nvme_scanned_json --argjson devices "$nvme_devices_json" --argjson cw "$nvme_cw_json" --argjson media "$nvme_media_err_json" --argjson pct "$nvme_pct80_json" '{scanned:$scanned, devices:$devices, alerts:{crit_warn_gt0:$cw, media_err_gt0:$media, pct_used_ge80:$pct}}')
+    local metrics_json
+    metrics_json=$(jq -n --argjson raid "$raid_metrics_json" --argjson smart "$smart_metrics_json" --argjson nvme "$nvme_metrics_json" '{raid:$raid, smart:$smart, nvme:$nvme}')
+
+    local severity=0
+    local vd_optimal=$((vd_total - vd_degraded - vd_failed))
+    (( vd_optimal < 0 )) && vd_optimal=0
+
+    if (( pd_failed >= PD_FAIL_CRIT )); then
+        (( severity < 2 )) && severity=2
+        fail_reasons+=("硬體 RAID: PD failed=${pd_failed}")
+    fi
+    if (( vd_failed > 0 )); then
+        (( severity < 2 )) && severity=2
+        fail_reasons+=("硬體 RAID: VD failed=${vd_failed}")
+    fi
+    if (( smart_failed_count >= SMART_ALERT_FAIL_CRIT )); then
+        (( severity < 2 )) && severity=2
+        fail_reasons+=("SMART FAILED: ${smart_failed_list[*]}")
+    fi
+    if (( nvme_cw_count >= NVME_CRIT_WARN_CRIT )); then
+        (( severity < 2 )) && severity=2
+        fail_reasons+=("NVMe critical_warning: ${nvme_cw_list[*]}")
+    fi
+
+    if (( vd_degraded >= VD_DEGRADED_WARN )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("硬體 RAID: VD degraded=${vd_degraded}")
+    fi
+    if (( vd_rebuild >= DISK_REBUILD_WARN )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("硬體 RAID: rebuild=${vd_rebuild}")
+    fi
+    if (( pd_missing > 0 )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("硬體 RAID: PD missing=${pd_missing}")
+    fi
+    if (( mdadm_degraded > 0 )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("mdadm degraded=${mdadm_degraded}")
+    fi
+    if (( mdadm_recovering > 0 )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("mdadm resync=${mdadm_recovering}")
+    fi
+    if (( smart_realloc_count >= SMART_REALLOC_WARN )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("SMART realloc>0: ${smart_realloc_list[*]}")
+    fi
+    if (( smart_pending_count >= SMART_PENDING_WARN )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("SMART pending>0: ${smart_pending_list[*]}")
+    fi
+    if (( smart_uncorr_count > 0 )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("SMART uncorrect>0: ${smart_uncorr_list[*]}")
+    fi
+    if (( nvme_media_err_count >= NVME_MEDIA_ERR_WARN )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("NVMe media_errors>0: ${nvme_media_err_list[*]}")
+    fi
+    if (( nvme_pct80_count > 0 )); then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("NVMe pct_used>=${NVME_PCT_USED_WARN}: ${nvme_pct80_list[*]}")
+    fi
+    if (( storcli_scanned == 0 )); then
+        (( severity < 2 )) && severity=1
+        case "$storcli_reason" in
+            not_found) warn_reasons+=("storcli 不存在，硬體 RAID 未檢查");;
+            root_required) warn_reasons+=("權限不足，storcli 無法執行");;
+            no_controllers) warn_reasons+=("storcli 未偵測到控制器");;
+            no_data) warn_reasons+=("storcli 無輸出，硬體 RAID 未檢查");;
+            not_supported) warn_reasons+=("storcli 未執行");;
+        esac
+    fi
+    if (( smart_scanned == 0 )); then
+        (( severity < 2 )) && severity=1
+        case "$smart_reason" in
+            tool_missing) warn_reasons+=("SMART 檢查跳過：smartctl 缺少");;
+            root_required) warn_reasons+=("SMART 檢查跳過：權限不足");;
+            *) warn_reasons+=("SMART 檢查未完成");;
+        esac
+    elif [[ -n "$smart_reason" ]]; then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("SMART 命令狀態：$smart_reason")
+    fi
+    if (( nvme_scanned == 0 )); then
+        (( severity < 2 )) && severity=1
+        case "$nvme_reason" in
+            tool_missing) warn_reasons+=("NVMe 檢查跳過：nvme CLI 缺少");;
+            root_required) warn_reasons+=("NVMe 檢查跳過：權限不足");;
+            command_failed) warn_reasons+=("NVMe 檢查未完成");;
+            smart_log_failed) warn_reasons+=("NVMe smart-log 失敗");;
+        esac
+    elif [[ -n "$nvme_reason" ]]; then
+        (( severity < 2 )) && severity=1
+        warn_reasons+=("NVMe smart-log 備註：$nvme_reason")
+    fi
+
+    local final_status="PASS"
+    case $severity in
+        2) final_status="FAIL";;
+        1) final_status="WARN";;
+    esac
+
     local final_reason
-    if [[ "$overall_status" == "PASS" ]]; then
-        final_reason="All disk, RAID, and SMART checks passed."
+    if (( severity == 0 )); then
+        if (( storcli_scanned )); then
+            final_reason=$(printf "RAID/SMART/NVMe 正常 (VD optimal=%d, SMART alerts=0, NVMe alerts=0)" "$vd_optimal")
+        else
+            final_reason="RAID/SMART/NVMe 正常"
+        fi
     else
-        final_reason=$(IFS=; echo "${reason_details[*]}")
+        local summary=$([[ $severity -eq 2 ]] && echo "磁碟檢測 FAIL" || echo "磁碟檢測 WARN")
+        local -a highlight_selection=()
+        if (( severity == 2 )); then
+            highlight_selection=("${fail_reasons[@]}")
+            if (( ${#highlight_selection[@]} < 3 )); then
+                highlight_selection+=("${warn_reasons[@]}")
+            fi
+        else
+            highlight_selection=("${warn_reasons[@]}")
+        fi
+        local highlight_text=""
+        if (( ${#highlight_selection[@]} > 0 )); then
+            local count=0
+            for entry in "${highlight_selection[@]}"; do
+                [[ -z "$entry" ]] && continue
+                highlight_text+="$entry; "
+                (( count++ ))
+                if (( count >= 3 )); then
+                    break
+                fi
+            done
+            highlight_text=${highlight_text%; }
+        fi
+        if [[ -n "$highlight_text" ]]; then
+            final_reason="$summary ($highlight_text)"
+        else
+            final_reason=$summary
+        fi
     fi
 
-    local metrics_json=$(jq -n \
-        --argjson smart "$smart_results_json" \
-        --argjson nvme "$nvme_results_json" \
-        --argjson mdstat "$mdstat_json" \
-        --argjson hwrail "$RAID_SUMMARY_JSON" \
-        '{smart_devices:$smart, nvme_devices:$nvme, software_raid:$mdstat, hardware_raid:$hwrail}')
+    local -a checks_entries=()
+    checks_entries+=("$(jq -n --arg raid_driver "$raid_driver" '{name:"RAID driver", ok:($raid_driver != "none"), value:$raid_driver}')")
+    checks_entries+=("$(jq -n --arg vd_deg "$vd_degraded" '{name:"VD degraded=0", ok:(($vd_deg|tonumber)==0), value:("degraded="+$vd_deg)}')")
+    checks_entries+=("$(jq -n --arg vd_fail "$vd_failed" '{name:"VD failed=0", ok:(($vd_fail|tonumber)==0), value:("failed="+$vd_fail)}')")
+    checks_entries+=("$(jq -n --arg vd_rb "$vd_rebuild" '{name:"VD rebuilding=0", ok:(($vd_rb|tonumber)==0), value:("rebuild="+$vd_rb)}')")
+    checks_entries+=("$(jq -n --arg pd_fail "$pd_failed" '{name:"PD failed=0", ok:(($pd_fail|tonumber)==0), value:("pd_failed="+$pd_fail)}')")
+    checks_entries+=("$(jq -n --arg pd_miss "$pd_missing" '{name:"PD missing=0", ok:(($pd_miss|tonumber)==0), value:("pd_missing="+$pd_miss)}')")
+    checks_entries+=("$(jq -n --arg smart_fail "$smart_failed_count" '{name:"SMART FAILED=0", ok:(($smart_fail|tonumber)==0), value:("failed="+$smart_fail)}')")
+    checks_entries+=("$(jq -n --arg smart_realloc "$smart_realloc_count" '{name:"SMART realloc=0", ok:(($smart_realloc|tonumber)==0), value:("realloc="+$smart_realloc)}')")
+    checks_entries+=("$(jq -n --arg smart_pending "$smart_pending_count" '{name:"SMART pending=0", ok:(($smart_pending|tonumber)==0), value:("pending="+$smart_pending)}')")
+    checks_entries+=("$(jq -n --arg smart_uncorr "$smart_uncorr_count" '{name:"SMART uncorrect=0", ok:(($smart_uncorr|tonumber)==0), value:("uncorr="+$smart_uncorr)}')")
+    checks_entries+=("$(jq -n --arg nvme_cw "$nvme_cw_count" '{name:"NVMe crit_warn=0", ok:(($nvme_cw|tonumber)==0), value:("crit_warn="+$nvme_cw)}')")
+    checks_entries+=("$(jq -n --arg nvme_media "$nvme_media_err_count" '{name:"NVMe media_err=0", ok:(($nvme_media|tonumber)==0), value:("media_err="+$nvme_media)}')")
+    checks_entries+=("$(jq -n --arg nvme_pct "$nvme_pct80_count" '{name:"NVMe pct_used<80", ok:(($nvme_pct|tonumber)==0), value:("pct_used>=80_count="+$nvme_pct)}')")
+    checks_entries+=("$(jq -n --arg md_issues "$mdadm_issue_count" '{name:"mdadm arrays healthy", ok:(($md_issues|tonumber)==0), value:("issues="+$md_issues)}')")
+    if (( storcli_scanned == 0 )); then
+        local storcli_value="not run"
+        case "$storcli_reason" in
+            not_found) storcli_value="not found";;
+            root_required) storcli_value="permission denied";;
+            no_controllers) storcli_value="no controllers";;
+            no_data) storcli_value="no data";;
+            not_supported) storcli_value="not supported";;
+        esac
+        checks_entries+=("$(jq -n --arg value "$storcli_value" '{name:"storcli available", ok:false, value:$value}')")
+    fi
+    if (( smart_scanned == 0 )); then
+        local smart_value="not run"
+        case "$smart_reason" in
+            tool_missing) smart_value="not found";;
+            root_required) smart_value="permission denied";;
+            command_failed) smart_value="command failed";;
+        esac
+        checks_entries+=("$(jq -n --arg value "$smart_value" '{name:"SMART available", ok:false, value:$value}')")
+    fi
+    if (( nvme_scanned == 0 )); then
+        local nvme_value="not run"
+        case "$nvme_reason" in
+            tool_missing) nvme_value="not found";;
+            root_required) nvme_value="permission denied";;
+            command_failed) nvme_value="command failed";;
+            smart_log_failed) nvme_value="smart-log failed";;
+        esac
+        checks_entries+=("$(jq -n --arg value "$nvme_value" '{name:"nvme-cli available", ok:false, value:$value}')")
+    fi
+    local checks_json='[]'
+    if (( ${#checks_entries[@]} > 0 )); then
+        checks_json=$(printf '%s\n' "${checks_entries[@]}" | jq -s '.')
+    fi
+
+    local th_json
+    th_json=$(jq -n \
+      --arg smart_req "$SMART_REQUIRED" \
+      --arg nvme_req "$NVME_REQUIRED" \
+      --arg root_req "$ROOT_REQUIRED" \
+      --arg disk_rebuild "$DISK_REBUILD_WARN" \
+      --arg pd_fail "$PD_FAIL_CRIT" \
+      --arg vd_deg "$VD_DEGRADED_WARN" \
+      --arg smart_fail "$SMART_ALERT_FAIL_CRIT" \
+      --arg smart_realloc "$SMART_REALLOC_WARN" \
+      --arg smart_pending "$SMART_PENDING_WARN" \
+      --arg nvme_cw "$NVME_CRIT_WARN_CRIT" \
+      --arg nvme_media "$NVME_MEDIA_ERR_WARN" \
+      --arg nvme_pct "$NVME_PCT_USED_WARN" \
+      '{SMART_REQUIRED:($smart_req|test("^(?i:true|1|yes)$")),
+        NVME_REQUIRED:($nvme_req|test("^(?i:true|1|yes)$")),
+        ROOT_REQUIRED:($root_req|test("^(?i:true|1|yes)$")),
+        DISK_REBUILD_WARN:($disk_rebuild|tonumber),
+        PD_FAIL_CRIT:($pd_fail|tonumber),
+        VD_DEGRADED_WARN:($vd_deg|tonumber),
+        SMART_ALERT_FAIL_CRIT:($smart_fail|tonumber),
+        SMART_REALLOC_WARN:($smart_realloc|tonumber),
+        SMART_PENDING_WARN:($smart_pending|tonumber),
+        NVME_CRIT_WARN_CRIT:($nvme_cw|tonumber),
+        NVME_MEDIA_ERR_WARN:($nvme_media|tonumber),
+        NVME_PCT_USED_WARN:($nvme_pct|tonumber)}')
 
     local evidence_json
-    evidence_json=$(jq -n --arg main_log "$LOG_TXT" '{main_output_log:$main_log}')
+    evidence_json=$(jq -n \
+      --arg main "$LOG_TXT" \
+      --arg stor "$storcli_summary_path" \
+      --arg md "$mdstat_log" \
+      --arg smart "$smart_log" \
+      --arg nvme "$nvme_log" \
+      '{main_output_log:$main,
+        storcli_summary:(if $stor=="" then null else $stor end),
+        mdadm_mdstat_log:(if $md=="" then null else $md end),
+        smart_scan_log:(if $smart=="" then null else $smart end),
+        nvme_smart_log:(if $nvme=="" then null else $nvme end)} | with_entries(select(.value != null))')
+
+    local pass_rules='["硬體/軟體 RAID 正常，SMART/NVMe 皆無異常屬性"]'
+    local warn_rules='["存在 rebuild/degraded/mdadm resync、SMART/NVMe 警訊或工具/權限不足"]'
+    local fail_rules='["硬體 RAID PD/VD 故障、SMART FAILED 或 NVMe critical_warning > 0"]'
+    local criteria="磁碟健康：整合硬體/軟體 RAID、SMART、NVMe 資料，故障條件觸發 FAIL，輕度異常或檢查跳過為 WARN。"
 
     local final_json
     final_json=$(jq -n \
-        --arg status "$overall_status" \
-        --arg item "$item" \
-        --argjson metrics "$metrics_json" \
-        --arg reason "$final_reason" \
-        --argjson evidence "$evidence_json" \
-        '{status: $status, item: $item, metrics: $metrics, reason: $reason, evidence: $evidence}')
+      --arg status "$final_status" \
+      --arg item "$item" \
+      --arg reason "$final_reason" \
+      --arg tips "$tips_text" \
+      --argjson metrics "$metrics_json" \
+      --argjson thresholds "$th_json" \
+      --argjson evidence "$evidence_json" \
+      '{status:$status, item:$item, reason:$reason, tips:($tips|split("\n")|map(select(.!=""))), metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
 
-    # --- Build judgement ---
-    local vd_failed=$(echo "$RAID_SUMMARY_JSON" | jq -r '.vd_failed // 0' 2>/dev/null)
-    local vd_degraded=$(echo "$RAID_SUMMARY_JSON" | jq -r '.vd_degraded // 0' 2>/dev/null)
-    local pd_failed=$(echo "$RAID_SUMMARY_JSON" | jq -r '.pd_failed // 0' 2>/dev/null)
-    local rebuild_present=$(echo "$RAID_SUMMARY_JSON" | jq -r '.rebuild_present // false' 2>/dev/null)
-
-    local th_json='{}'  # Disks 項目無固定數值閾值
-
-    local checks_json
-    checks_json=$(jq -n \
-      --arg raid_status "$raid_status" \
-      --arg vd_failed "$vd_failed" \
-      --arg vd_degraded "$vd_degraded" \
-      --arg pd_failed "$pd_failed" \
-      --arg rebuild "$rebuild_present" \
-      --arg mdstat_status "$mdstat_status" \
-      '[{"name":"硬體 RAID VD 故障=0","ok":($vd_failed|tonumber==0),"value":("vd_failed="+$vd_failed)},
-        {"name":"硬體 RAID VD 降級=0","ok":($vd_degraded|tonumber==0),"value":("vd_degraded="+$vd_degraded)},
-        {"name":"硬體 RAID PD 故障=0","ok":($pd_failed|tonumber==0),"value":("pd_failed="+$pd_failed)},
-        {"name":"無 Rebuild/Init 進行中","ok":($rebuild!="true"),"value":("rebuild="+$rebuild)},
-        {"name":"軟體 RAID 狀態","ok":($mdstat_status!="FAIL"),"value":("mdstat="+$mdstat_status)}]')
-
-    local pass_rules='["VD/PD 故障=0 且 VD 降級=0 且無 Rebuild 且 SMART 無異常"]'
-    local warn_rules='["Rebuild/Init 進行中 或 SMART 有 pre-fail/reallocated sectors 或軟體 RAID resyncing"]'
-    local fail_rules='["VD 故障>0 或 PD 故障>0 或 VD 降級>0 或軟體 RAID degraded 或 SMART FAILED"]'
-    local criteria="磁碟健康：硬體/軟體 RAID 無故障/降級、無 rebuild、SMART 屬性正常"
+    printf '%s\n' "$final_json" > "$metrics_path"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
