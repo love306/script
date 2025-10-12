@@ -125,6 +125,8 @@ ENV_TEMP_WARN=35
 ENV_TEMP_CRIT=40
 
 FAN_RPM_TH=300
+: "${DEVIATION_WARN_PCT:=20}"
+: "${DEVIATION_CRIT_PCT:=40}"
 
 NIC_BASELINE_FILE=""
 STORCLI_BIN="/opt/MegaRAID/storcli/storcli64"
@@ -1980,15 +1982,22 @@ check_cpu() {
     local checks_json
     checks_json=$(jq -n \
       --arg max_temp "$max_temp" \
+      --arg max_display "$max_temp_display" \
+      --arg avg_temp "$avg_temp_display" \
+      --arg peak "$peak_display" \
       --arg warn "$CPU_TEMP_WARN" \
       --arg crit "$CPU_TEMP_CRIT" \
-      '[{"name":"Max Temp <= WARN","ok":(($max_temp|tonumber) <= ($warn|tonumber)),"value":("max="+$max_temp+"°C")},
-        {"name":"Max Temp <= CRIT","ok":(($max_temp|tonumber) <= ($crit|tonumber)),"value":("max="+$max_temp+"°C")}]')
+      '[
+         {"name":"Max Temp <= WARN","ok":((($max_temp|tonumber) <= ($warn|tonumber))),"value":("max="+$max_display+"°C")},
+         {"name":"Max Temp <= CRIT","ok":((($max_temp|tonumber) <= ($crit|tonumber))),"value":("max="+$max_display+"°C")},
+         {"name":"Rolling Avg (90d)","ok":true,"value":("avg="+$avg_temp+"°C")},
+         {"name":"90d Peak","ok":true,"value":("peak="+$peak+"°C")}
+       ]')
 
     local pass_rules='["最大 CPU 溫度 <= WARN"]'
     local warn_rules='["WARN < 最大 CPU 溫度 <= CRIT"]'
     local fail_rules='["最大 CPU 溫度 > CRIT"]'
-    local criteria="CPU 溫度：代表性核心的當前最大值 ≤ WARN（\${CPU_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（\${CPU_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。附帶 90 天峰值與移動平均作對照。"
+    local criteria="CPU 溫度：代表性核心的當前最大值 ≤ WARN（${CPU_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（${CPU_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。附帶 90 天峰值與移動平均作對照。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2264,8 +2273,19 @@ check_nic() {
               --argjson rx_pkts_delta "$d_rx_pkts" \
               --arg rx_drop_rate_per_sec "$r_rx_d" \
               --arg drop_percentage "$drop_pct" \
-              --argjson thresholds "$(jq -n --argjson d "$NIC_WARN_MIN_DELTA" --arg p "$NIC_WARN_MIN_PCT" --arg r "$NIC_WARN_MIN_RX_DROP_RATE" \
-                                       '{min_delta:$d, min_pct:($p|tonumber), min_rx_drop_rate_per_sec:($r|tonumber)}')" \
+              --argjson thresholds "$(jq -n \
+                  --argjson d "$NIC_WARN_MIN_DELTA" \
+                  --arg p "$NIC_WARN_MIN_PCT" \
+                  --arg r "$NIC_WARN_MIN_RX_DROP_RATE" \
+                  --arg rate_min "$NIC_RATE_MIN_DELTA" \
+                  --arg win "$NIC_MIN_WINDOW_SEC" \
+                  --arg pkts "$NIC_MIN_RX_PKTS" \
+                  '{min_delta:$d,
+                    min_pct:($p|tonumber),
+                    min_rx_drop_rate_per_sec:($r|tonumber),
+                    rate_min_delta:($rate_min|tonumber),
+                    min_window_sec:($win|tonumber),
+                    min_rx_pkts:($pkts|tonumber)}')" \
               '{scope:$scope, iface:$iface, speed:$speed, duplex:$duplex, link:$link,
                 counters:$increments,
                 rx_packets:($rx_pkts_now|tonumber), rx_packets_delta:$rx_pkts_delta,
@@ -2314,7 +2334,15 @@ check_nic() {
       --arg min_delta "$NIC_WARN_MIN_DELTA" \
       --arg min_pct "$NIC_WARN_MIN_PCT" \
       --arg min_rx_drop_rate "$NIC_WARN_MIN_RX_DROP_RATE" \
-      '{NIC_WARN_MIN_DELTA: ($min_delta|tonumber), NIC_WARN_MIN_PCT: ($min_pct|tonumber), NIC_WARN_MIN_RX_DROP_RATE: ($min_rx_drop_rate|tonumber)}')
+      --arg rate_min_delta "$NIC_RATE_MIN_DELTA" \
+      --arg min_window "$NIC_MIN_WINDOW_SEC" \
+      --arg min_rx_pkts "$NIC_MIN_RX_PKTS" \
+      '{NIC_WARN_MIN_DELTA: ($min_delta|tonumber),
+        NIC_WARN_MIN_PCT: ($min_pct|tonumber),
+        NIC_WARN_MIN_RX_DROP_RATE: ($min_rx_drop_rate|tonumber),
+        NIC_RATE_MIN_DELTA: ($rate_min_delta|tonumber),
+        NIC_MIN_WINDOW_SEC: ($min_window|tonumber),
+        NIC_MIN_RX_PKTS: ($min_rx_pkts|tonumber)}')
 
     # 只把標記為 ISSUE 的介面列入 checks (ok:false)
     local checks_json='[]'
@@ -2333,9 +2361,11 @@ check_nic() {
     fi
 
     local pass_rules='["所有 NIC rx_dropped/tx_dropped/rx_errors/tx_errors 等計數器穩定，link=yes"]'
-    local warn_rules='["任一 NIC 滿足以下任一條件：① Δrx_dropped ≥ MIN_DELTA，② drop% ≥ MIN_PCT，③ rx_drop_rate ≥ MIN_RX_DROP_RATE/s，④ link=no"]'
+    local warn_rules
+    warn_rules=$(printf '["任一 NIC 滿足：① Δrx_dropped ≥ %s；② drop%% ≥ %s%% 且 Δ ≥ %s；③ rx_drop_rate ≥ %s/s 且 Δ ≥ %s；④ uplink link=no"]' \
+      "$NIC_WARN_MIN_DELTA" "$NIC_WARN_MIN_PCT" "$NIC_RATE_MIN_DELTA" "$NIC_WARN_MIN_RX_DROP_RATE" "$NIC_RATE_MIN_DELTA")
     local fail_rules='["（保留給未來擴充：嚴重錯誤率或持續 link down）"]'
-    local criteria="NIC 健康：只以錯誤/丟包作為異常判定。於觀測窗內，若任一介面滿足以下任一條件則 WARN：① Δrx_dropped ≥ \${NIC_WARN_MIN_DELTA}；② 丟包率 ≥ \${NIC_WARN_MIN_PCT}%；③ 丟包速率 ≥ \${NIC_WARN_MIN_RX_DROP_RATE}/s；④ link=no。否則 PASS。"
+    local criteria="NIC 健康：樣本需滿足視窗 ≥ ${NIC_MIN_WINDOW_SEC}s 且封包數 ≥ ${NIC_MIN_RX_PKTS}。若任一介面符合 ① Δrx_dropped ≥ ${NIC_WARN_MIN_DELTA}；② drop% ≥ ${NIC_WARN_MIN_PCT}% 且 Δ ≥ ${NIC_RATE_MIN_DELTA}；③ rx_drop_rate ≥ ${NIC_WARN_MIN_RX_DROP_RATE}/s 且 Δ ≥ ${NIC_RATE_MIN_DELTA}；或 ④ uplink link=no（非 uplink 僅記錄）則 WARN；全部穩定則 PASS。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -2597,30 +2627,40 @@ check_fans() {
         --arg item "$item" \
         --arg reason "$final_reason" \
         --argjson metrics "[$(IFS=,; echo "${metrics_array[*]}")]" \
-        --argjson thresholds "{\"low_rpm_th\": ${FAN_RPM_TH}, \"deviation_warn_pct\": 20, \"deviation_crit_pct\": 40}" \
+        --argjson thresholds "{\"low_rpm_th\": ${FAN_RPM_TH}, \"deviation_warn_pct\": ${DEVIATION_WARN_PCT}, \"deviation_crit_pct\": ${DEVIATION_CRIT_PCT}}" \
         --argjson evidence "{\"sensors_log\": \"${raw_sensors_log}\", \"ipmi_sdr_log\": \"${raw_ipmi_sdr_log}\", \"baseline_file\": \"${baseline_path}\"}" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
 
     # --- Build judgement ---
     local th_json
-    th_json=$(jq -n --arg rpm_th "$FAN_RPM_TH" \
-      '{FAN_RPM_TH: ($rpm_th|tonumber), DEVIATION_WARN_PCT: 20, DEVIATION_CRIT_PCT: 40}')
+    th_json=$(jq -n \
+      --arg rpm_th "$FAN_RPM_TH" \
+      --arg warn_pct "$DEVIATION_WARN_PCT" \
+      --arg crit_pct "$DEVIATION_CRIT_PCT" \
+      '{FAN_RPM_TH: ($rpm_th|tonumber), DEVIATION_WARN_PCT: ($warn_pct|tonumber), DEVIATION_CRIT_PCT: ($crit_pct|tonumber)}')
 
+    local fan_count="${#metrics_json_array[@]}"
     local checks_json
     checks_json=$(jq -n \
       --arg low_count "$low_rpm_count" \
       --arg dev_crit_count "$deviation_crit_count" \
       --arg dev_warn_count "$deviation_warn_count" \
-      --arg fan_count "${#metrics_json_array[@]}" \
-      '[{"name":"低轉速風扇數=0","ok":($low_count|tonumber==0),"value":("low_rpm_count="+$low_count)},
-        {"name":"嚴重偏差風扇數=0","ok":($dev_crit_count|tonumber==0),"value":("deviation_crit="+$dev_crit_count)},
-        {"name":"警告偏差風扇數=0","ok":($dev_warn_count|tonumber==0),"value":("deviation_warn="+$dev_warn_count)},
-        {"name":"檢測到的風扇數","ok":($fan_count|tonumber>0),"value":("fans="+$fan_count)}]')
+      --arg fan_count "${fan_count:-0}" \
+      --arg rpm_th "$FAN_RPM_TH" \
+      --arg warn_pct "$DEVIATION_WARN_PCT" \
+      --arg crit_pct "$DEVIATION_CRIT_PCT" \
+      '[
+         {"name":"低轉速風扇數=0","ok":($low_count|tonumber==0),"value":("low_rpm_count="+$low_count)},
+         {"name":"嚴重偏差風扇數=0","ok":($dev_crit_count|tonumber==0),"value":("deviation_crit="+$dev_crit_count)},
+         {"name":"警告偏差風扇數=0","ok":($dev_warn_count|tonumber==0),"value":("deviation_warn="+$dev_warn_count)},
+         {"name":"檢測到的風扇數","ok":($fan_count|tonumber>0),"value":("fans="+$fan_count)},
+         {"name":"門檻","ok":true,"value":("FAN_RPM_TH="+$rpm_th+", WARN_PCT="+$warn_pct+"%, CRIT_PCT="+$crit_pct+"%")}
+       ]')
 
-    local pass_rules='["所有風扇轉速 >= FAN_RPM_TH 且偏差 <= 20%"]'
-    local warn_rules='["任一風扇轉速 < FAN_RPM_TH 或 20% < 偏差 <= 40%"]'
-    local fail_rules='["任一風扇偏差 > 40%"]'
-    local criteria="風扇健康：所有風扇 RPM ≥ \${FAN_RPM_TH}；相對 baseline 偏差 ≤ \${DEVIATION_WARN_PCT}% 為 PASS；偏差 > \${DEVIATION_CRIT_PCT}% 為 FAIL。"
+    local pass_rules=$(printf '["所有風扇轉速 >= FAN_RPM_TH 且偏差 <= %s%%"]' "$DEVIATION_WARN_PCT")
+    local warn_rules=$(printf '["任一風扇轉速 < FAN_RPM_TH 或 %s%% < 偏差 <= %s%%"]' "$DEVIATION_WARN_PCT" "$DEVIATION_CRIT_PCT")
+    local fail_rules=$(printf '["任一風扇偏差 > %s%%"]' "$DEVIATION_CRIT_PCT")
+    local criteria="風扇健康：所有風扇 RPM ≥ ${FAN_RPM_TH}；相對 baseline 偏差 ≤ ${DEVIATION_WARN_PCT}% 為 PASS；偏差 > ${DEVIATION_CRIT_PCT}% 為 FAIL。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -3131,9 +3171,9 @@ check_bmc() {
     esc_event=$(echo "$event" | sed 's/"/\\"/g')
     esc_sensor=$(echo "$sensor" | sed 's/"/\\"/g')
     raw_esc=$(echo "$rawline" | sed 's/"/\\"/g')
-    EVENTS_JSON+=("{\"id\":\"$f1\",\"date\":\"$f2\",\"time\":\"$f3\",\"datetime\":\"$dt_iso\",\"sensor\":\"$esc_sensor\",\"event\":\"$esc_event\",\"severity\":\"$sev\",\"raw\":\"$raw_esc\"}")
+    EVENTS_JSON+=("{\"id\":\"$f1\",\"date\":\"$f2\",\"time\":\"$f3\",\"datetime\":\"$dt_iso\",\"sensor\":\"$esc_sensor\",\"event\":\"$esc_event\",\"severity\":\"$sev\",\"level\":\"$sev\",\"raw\":\"$raw_esc\"}")
     if [[ "$sev" == "CRIT" || "$sev" == "WARN" ]]; then
-      SEL_CW_EVENTS_ARRAY+=("{\"id\":\"$f1\",\"datetime\":\"$dt_iso\",\"sensor\":\"$esc_sensor\",\"event\":\"$esc_event\",\"severity\":\"$sev\"}")
+      SEL_CW_EVENTS_ARRAY+=("{\"id\":\"$f1\",\"datetime\":\"$dt_iso\",\"sensor\":\"$esc_sensor\",\"event\":\"$esc_event\",\"severity\":\"$sev\",\"level\":\"$sev\"}")
     fi
   done <<< "$sel_raw"
 
@@ -3187,58 +3227,31 @@ check_bmc() {
     final_reason="SEL WARN=$SEL_WARN"
   fi
 
-  # 計算「已 X 天未再發」 - 直接從 SEL_CW_EVENTS_ARRAY 找最新的
-  local last_cw_ts=0
-  local days_since_last="N/A"
-  local last_cw_date=""
+  local last_cw_date="" last_cw_ts="" _dt="" _mmdd="" days_since_last=""
 
-  # 從已解析的 CRIT/WARN events 中找最近的 (陣列最後一個就是最新的)
-  if [[ "${#SEL_CW_EVENTS_ARRAY[@]}" -gt 0 ]]; then
-    # 取最後一個 event 的 datetime（使用 bash 切片語法取最後一個元素）
-    local last_event
-    last_event="${SEL_CW_EVENTS_ARRAY[@]: -1:1}"
-    last_cw_date=$(echo "$last_event" | jq -r '.datetime' 2>/dev/null || echo "")
+  # ---- [SEL] append "X 天前" 到 Reason ----
+  # 需要：SEL_EVENTS_JSON、SEL_DAYS、SCRIPT_START_TS、final_reason、SEL_CRIT、SEL_WARN
+  {
+    last_cw_date="$(jq -r 'map(select(.level=="CRIT" or .level=="WARN")) | last | .datetime // empty' "$SEL_EVENTS_JSON" 2>/dev/null)"
+  } || true
 
-    echo "[SEL] DEBUG: Found ${#SEL_CW_EVENTS_ARRAY[@]} CRIT/WARN events, last_cw_date='$last_cw_date'" >&2
-
-    if [[ -n "$last_cw_date" && "$last_cw_date" != "null" ]]; then
-      # 嘗試多種日期格式轉換
-      # 格式 1: MM-DD-YYYYTHH:MM:SS (IPMI 常見格式)
-      last_cw_ts=$(date -d "${last_cw_date}" +%s 2>/dev/null || echo "0")
-
-      # 格式 2: 如果失敗，嘗試去掉 T
-      if [[ "$last_cw_ts" == "0" ]]; then
-        local clean_date="${last_cw_date//T/ }"
-        last_cw_ts=$(date -d "${clean_date}" +%s 2>/dev/null || echo "0")
-      fi
-
-      # 格式 3: 如果還是失敗，嘗試標準化 MM-DD-YYYY 為 YYYY-MM-DD
-      if [[ "$last_cw_ts" == "0" && "$last_cw_date" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})(.*)$ ]]; then
-        local normalized="${BASH_REMATCH[3]}-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[4]//T/ }"
-        last_cw_ts=$(date -d "${normalized}" +%s 2>/dev/null || echo "0")
-      fi
-
-      if [[ "$last_cw_ts" -gt 0 ]]; then
-        days_since_last=$(( (now_epoch - last_cw_ts) / 86400 ))
-        echo "[SEL] DEBUG: Calculated days_since_last=$days_since_last (now=$now_epoch, last=$last_cw_ts)" >&2
+  if [[ -n "$last_cw_date" ]]; then
+    _dt="${last_cw_date/T/ }"
+    last_cw_ts="$(date -d "$_dt" +%s 2>/dev/null || true)"
+    if [[ -z "$last_cw_ts" ]]; then
+      _mmdd="$(sed -E 's#^([0-9]{2})-([0-9]{2})-([0-9]{4})#\3-\1-\2#' <<< "$_dt")"
+      last_cw_ts="$(date -d "$_mmdd" +%s 2>/dev/null || true)"
+    fi
+    if [[ -n "$last_cw_ts" ]]; then
+      days_since_last=$(( (SCRIPT_START_TS - last_cw_ts) / 86400 ))
+      if (( SEL_CRIT==0 && SEL_WARN==0 )); then
+        final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 ${days_since_last} 天未再發"
       else
-        echo "[SEL] DEBUG: Failed to parse date: $last_cw_date" >&2
+        final_reason+=" (最近一次 CRIT/WARN 為 ${days_since_last} 天前)"
       fi
     fi
-  else
-    echo "[SEL] DEBUG: No CRIT/WARN events in SEL_CW_EVENTS_ARRAY" >&2
   fi
-
-  # 更新 reason - 根據狀態附加天數資訊
-  if [[ "$days_since_last" != "N/A" && "$days_since_last" -ge 0 ]]; then
-    if [[ "$final_status" == "PASS" ]]; then
-      final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 ${days_since_last} 天未再發"
-    else
-      final_reason="${final_reason} (最近一次 CRIT/WARN 為 ${days_since_last} 天前)"
-    fi
-  elif [[ "$final_status" == "PASS" ]]; then
-    final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN 事件"
-  fi
+  # -----------------------------------------
 
   local final_json
   final_json=$(jq -n --arg item "$item" --arg status "$final_status" --arg reason "$final_reason" --argjson evidence "$evidence" \
@@ -3262,7 +3275,7 @@ check_bmc() {
   local pass_rules='["SEL_DAYS 視窗內 CRIT=0 且 WARN=0"]'
   local warn_rules='["SEL WARN>0 但 CRIT=0"]'
   local fail_rules='["SEL CRIT>0"]'
-  local criteria="BMC/SEL 健康：過去 \${SEL_DAYS} 天內 CRIT=0 且 WARN=0 為 PASS；有 WARN 且無 CRIT 為 WARN；有 CRIT 為 FAIL。"
+  local criteria="BMC/SEL 健康：過去 ${SEL_DAYS} 天內 CRIT=0 且 WARN=0 為 PASS；有 WARN 且無 CRIT 為 WARN；有 CRIT 為 FAIL。"
 
   local jdg_json
   jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -3321,7 +3334,7 @@ BIOS_VERSION=""
 check_firmware() {
   echo -e "${C_BLUE}[14] 韌體版本${C_RESET}"
   local bios
-  bios=$(dmidecode -t bios 2>/dev/null | egrep -i 'Version|Release Date' || true)
+  bios=$(sudo dmidecode -t bios 2>/dev/null | egrep -i 'Version|Release Date' || true)
   echo "$bios"
   BIOS_VERSION=$(echo "$bios" | grep -i 'Version' | head -n1 | awk -F: '{print $2}' | xargs || echo "")
   if (( ! SKIP_BMC )); then
@@ -3676,7 +3689,10 @@ if [[ -n "$THRESHOLDS_JSON" ]]; then
   "io_write_min": $IO_WRITE_MIN,
   "nic_warn_min_delta":  "$NIC_WARN_MIN_DELTA",
   "nic_warn_min_pct":    "$NIC_WARN_MIN_PCT",
-  "nic_warn_min_rx_drop_rate": "$NIC_WARN_MIN_RX_DROP_RATE"
+  "nic_warn_min_rx_drop_rate": "$NIC_WARN_MIN_RX_DROP_RATE",
+  "nic_min_window_sec": "$NIC_MIN_WINDOW_SEC",
+  "nic_min_rx_pkts": "$NIC_MIN_RX_PKTS",
+  "nic_rate_min_delta": "$NIC_RATE_MIN_DELTA"
 }
 TJSON
   } > "$THRESHOLDS_JSON"
