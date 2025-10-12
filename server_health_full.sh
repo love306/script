@@ -72,6 +72,42 @@ LANG=C
 
 SCRIPT_START_TS=$(date +%s)
 
+# --- helper: commit item2 safety without interfering surrounding blocks ---
+commit_item2_safety() {
+  : "${final_status:=}"
+  : "${final_reason:=}"
+  : "${raid_controller_count:=0}"
+  : "${smart_failed_count:=0}"
+  : "${nvme_media_err_count:=0}"
+  if [[ -z "$final_status" ]]; then
+    if (( raid_controller_count==0 )) && (( smart_failed_count==0 )) && (( nvme_media_err_count==0 )); then
+      final_status="INFO"
+      final_reason="No disk devices detected (RAID controllers=0, SMART disks=0, NVMe devices=0)"
+    else
+      final_status="PASS"
+      [[ -z "$final_reason" ]] && final_reason="All disk, RAID, and SMART checks passed."
+    fi
+  fi
+  if [[ -z "${__DISK_ITEM2_COMMITTED:-}" ]]; then
+    __DISK_ITEM2_COMMITTED=1
+    set_check_result_with_jdg 2 "$final_status" "$final_reason" "${tips_json:-[]}" "${judgement_json:-{}}" "${evidence_json:-{}}"
+  fi
+}
+
+
+# --- helper: normalize MM/DD/YYYY or MM-DD-YYYY to MM/DD/YYYY ---
+normalize_mmddyyyy() {
+  local d="$1"
+  local d="$1"
+  # 接受 MM-DD-YYYY 或 MM/DD-YYYY，統一轉成 /
+  if [[ "$d" =~ ^[0-9]{2}[-/][0-9]{2}[-/][0-9]{4}$ ]]; then
+    echo "${d//-//}"
+  else
+    echo "$d"
+  fi
+}
+
+
 # ----------------- 預設參數 -----------------
 BMC_IP="${BMC_IP:-}"
 BMC_USER="${BMC_USER:-}"
@@ -568,15 +604,26 @@ set_status() {
       criteria="列舉系統各組件的韌體/驅動版本，包括：BIOS（dmidecode）、BMC（ipmitool mc info）、NIC driver/firmware（ethtool -i）、GPU driver（nvidia-smi）、磁碟韌體（smartctl）、NVMe（nvme list）。此為 INFO 項目，需人工比對是否為最新版本或已知穩定版本。"
       info_rules='["列出 BIOS/BMC/NIC/GPU/Disk 韌體版本供人工比對"]'
 
-      local bios_ok=false
-      [[ -n "${BIOS_VERSION:-}" ]] && bios_ok=true
+      local bios_ok_json="false"
+      [[ -n "${BIOS_VERSION:-}" ]] && bios_ok_json="true"
+      local bios_value="${BIOS_VERSION_CHECK_VALUE:-}"
+      if [[ -z "$bios_value" ]]; then
+        if [[ "$bios_ok_json" == "true" ]]; then
+          bios_value="true"
+        else
+          bios_value="not retrieved"
+        fi
+      fi
+      local enum_value="${FIRMWARE_ENUM_MESSAGE:-dmidecode/ethtool/smartctl executed}"
 
       checks_json=$(jq -n \
-        --argjson bios_ok "$bios_ok" \
+        --argjson bios_ok "$bios_ok_json" \
+        --arg bios_value "$bios_value" \
+        --arg enum_value "$enum_value" \
         --arg st "$st" \
         '[
-          {"name":"BIOS version retrieved", "ok":$bios_ok, "value":($bios_ok|tostring)},
-          {"name":"Firmware enumeration", "ok":true, "value":"dmidecode/ethtool/smartctl executed"},
+          {"name":"BIOS version retrieved", "ok":$bios_ok, "value":$bios_value},
+          {"name":"Firmware enumeration", "ok":true, "value":$enum_value},
           {"name":"Manual comparison required", "ok":($st=="INFO"), "value":"Human review needed"}
         ]')
       ;;
@@ -787,7 +834,7 @@ last_event_epoch_in_sel(){
     grep -qi 'Deasserted' <<< "$line" && continue
     IFS='|' read -r f1 f2 f3 f4 f5 rest <<< "$line"
     f2=$(printf '%s' "$f2" | trim); f3=$(printf '%s' "$f3" | trim)
-    local ts; ts=$(date -d "$f2 $f3" +%s 2>/dev/null || echo "")
+    local ts; ts=$(date -d "$(normalize_mmddyyyy "$f2") $f3" +%s 2>/dev/null || echo "")
     [[ -z "$ts" ]] && continue
     (( ts < cutoff )) && continue
     local low; low=$(echo "$line" | tr '[:upper:]' '[:lower:]')
@@ -1050,6 +1097,7 @@ TIPS
 ${STORCLI_BIN:-/opt/MegaRAID/storcli/storcli64} show all | less
 sudo smartctl -H -A /dev/sdX  # Replace sdX with the correct device
 nvme smart-log /dev/nvme0n1 # Replace with correct device
+jq '.items[] | select(.id==2)' \$(ls logs/*_latest.json | grep -v thresholds_latest.json)
 TIPS
     ;;
     3) cat <<TIPS
@@ -1075,6 +1123,11 @@ TIPS
     7) cat <<TIPS
 sensors | grep -Ei 'fan'
 ipmitool -I lanplus -H "${BMC_IP:-<ip>}" -U "${BMC_USER:-<user>}" -E sdr elist | grep -i fan
+# 查詢 master JSON（排除 thresholds）
+jq '.items[] | select(.id==7) | .judgement.checks' \
+  \$(ls logs/*_latest.json | grep -v thresholds_latest.json)
+# 查詢異常風扇（低 RPM 或高偏差）
+jq '.metrics[] | select(.rpm < 300 or (.dev_pct|tonumber) > 20)' logs/fan/fan_eval_*.json
 TIPS
     ;;
     8) cat <<TIPS
@@ -1458,6 +1511,7 @@ collect_raid_megaraid() {
 check_disks() {
     local item="Disks.RAID.SMART"
     echo -e "${C_BLUE}[2] 磁碟 / RAID / SMART${C_RESET}"
+    # Quick verify: jq '.items[] | select(.id==2)' logs/*_latest.json
 
     : "${SMART_REQUIRED:=true}"
     : "${NVME_REQUIRED:=true}"
@@ -1477,8 +1531,9 @@ check_disks() {
     local disk_dir="$LOG_DIR/disks"
     mkdir -p "$disk_dir"
     local metrics_path="${disk_dir}/metrics_${TIMESTAMP}.json"
-    local smart_log=""
-    local nvme_log=""
+    local smart_json_path="${disk_dir}/smart_scan_${TIMESTAMP}.json"
+    local nvme_json_path="${disk_dir}/nvme_smart_${TIMESTAMP}.json"
+    local disk_summary_path="${disk_dir}/disk_summary_${TIMESTAMP}.json"
     local mdstat_log=""
     local storcli_summary_path=""
 
@@ -1514,8 +1569,6 @@ check_disks() {
         root_access=1
     fi
 
-    lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,MOUNTPOINT || true
-
     RAID_STATUS_IMPACT=""
     RAID_SUMMARY_JSON="{}"
     RAID_REBUILD_PRESENT=0
@@ -1527,6 +1580,7 @@ check_disks() {
     local vd_degraded=0
     local vd_failed=0
     local vd_rebuild=0
+    local pd_total=0
     local pd_failed=0
     local pd_missing=0
     local mdadm_arrays_found=0
@@ -1544,6 +1598,7 @@ check_disks() {
     local -a nvme_cw_list=()
     local -a nvme_media_err_list=()
     local -a nvme_pct80_list=()
+    local nvme_temp_max=""
     local -a warn_reasons=()
     local -a fail_reasons=()
 
@@ -1553,6 +1608,15 @@ check_disks() {
     local nvme_reason=""
     local storcli_scanned=0
     local storcli_reason=""
+    local storcli_check_skipped=0
+
+    local tool_issue_flag=0
+    local -a missing_tools=()
+
+    local storcli_state="missing"
+    local smartctl_state="missing"
+    local nvme_state="missing"
+    local lsblk_state="missing"
 
     local storcli_available=0
     local storcli_cmd="${RAID_STORCLI_CMD:-$STORCLI_BIN}"
@@ -1560,11 +1624,47 @@ check_disks() {
     storcli_bin="${storcli_bin%% *}"
     if [[ -n "$storcli_bin" ]] && { command -v "$storcli_bin" >/dev/null 2>&1 || [[ -x "$storcli_bin" ]]; }; then
         storcli_available=1
+        storcli_state="available"
     fi
     local smartctl_available=0
-    command -v smartctl >/dev/null 2>&1 && smartctl_available=1
+    if command -v smartctl >/dev/null 2>&1; then
+        smartctl_available=1
+        smartctl_state="available"
+    fi
     local nvme_available=0
-    command -v nvme >/dev/null 2>&1 && nvme_available=1
+    if command -v nvme >/dev/null 2>&1; then
+        nvme_available=1
+        nvme_state="available"
+    fi
+    local lsblk_available=0
+
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk_available=1
+        lsblk_state="ok"
+        lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,MOUNTPOINT || true
+    else
+        missing_tools+=("lsblk")
+        tool_issue_flag=1
+    fi
+
+    if (( storcli_available == 0 )); then
+        missing_tools+=("storcli64")
+        tool_issue_flag=1
+    else
+        storcli_state="available"
+    fi
+    if (( smartctl_available == 0 )); then
+        missing_tools+=("smartctl")
+        tool_issue_flag=1
+    else
+        smartctl_state="available"
+    fi
+    if (( nvme_available == 0 )); then
+        missing_tools+=("nvme-cli")
+        tool_issue_flag=1
+    else
+        nvme_state="available"
+    fi
 
     if (( storcli_available )) && (( root_access )); then
         collect_raid_megaraid
@@ -1597,6 +1697,7 @@ check_disks() {
             if [[ -n "$raid_controllers_json" && "$raid_controllers_json" != "[]" ]]; then
                 storcli_scanned=1
                 raid_driver="storcli"
+                storcli_state="ok"
                 storcli_summary_path="${disk_dir}/storcli_summary_${TIMESTAMP}.json"
                 printf '%s\n' "$raid_summary_raw" > "$storcli_summary_path"
                 vd_total=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_total // 0)' 2>/dev/null)
@@ -1605,6 +1706,8 @@ check_disks() {
                 [[ -z "$vd_degraded" ]] && vd_degraded=0
                 vd_failed=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_failed // 0)' 2>/dev/null)
                 [[ -z "$vd_failed" ]] && vd_failed=0
+                pd_total=$(echo "$raid_summary_raw" | jq -r '(.agg.pd_total // 0)' 2>/dev/null)
+                [[ -z "$pd_total" ]] && pd_total=0
                 pd_failed=$(echo "$raid_summary_raw" | jq -r '(.agg.pd_failed // 0)' 2>/dev/null)
                 [[ -z "$pd_failed" ]] && pd_failed=0
                 pd_missing=$(echo "$raid_summary_raw" | jq -r '(.agg.pd_missing // 0)' 2>/dev/null)
@@ -1613,17 +1716,27 @@ check_disks() {
                 [[ -z "$vd_rebuild" ]] && vd_rebuild=0
             else
                 storcli_reason="no_controllers"
+                storcli_state="no_controllers"
             fi
         else
             storcli_reason="no_data"
+            storcli_state="no_data"
         fi
     else
         if (( storcli_available == 0 )); then
             storcli_reason="not_found"
+            storcli_check_skipped=1
+            storcli_state="missing"
         elif (( root_access == 0 )); then
             storcli_reason="root_required"
+            storcli_check_skipped=1
+            storcli_state="permission"
+            missing_tools+=("storcli64(permission)")
+            tool_issue_flag=1
         else
             storcli_reason="not_supported"
+            storcli_check_skipped=1
+            storcli_state="not_supported"
         fi
     fi
 
@@ -1683,89 +1796,154 @@ check_disks() {
     if (( smartctl_available == 0 )); then
         smart_scanned=0
         smart_reason="tool_missing"
+        smartctl_state="missing"
     elif (( smart_required_flag )) && (( root_access == 0 )); then
         smart_scanned=0
         smart_reason="root_required"
+        smartctl_state="permission"
+        missing_tools+=("smartctl(permission)")
+        tool_issue_flag=1
     fi
 
-    local -a SMART_CMD=()
+    local -a SMART_BASE_CMD=()
     if (( smartctl_available )); then
-        SMART_CMD=("${sudo_prefix[@]}" smartctl)
+        SMART_BASE_CMD=("${sudo_prefix[@]}" smartctl)
     fi
     if (( smart_scanned )); then
-        local -a smart_disks=()
-        while read -r name type; do
-            if [[ "$type" == "disk" ]]; then
-                smart_disks+=("/dev/$name")
+        local -a smart_targets=()
+        declare -A SMART_SEEN_TARGETS=()
+        local scan_json
+        scan_json=$("${SMART_BASE_CMD[@]}" --scan-open -j 2>/dev/null || true)
+        if [[ -n "$scan_json" ]]; then
+            while IFS='|' read -r name dtype; do
+                [[ -z "$name" ]] && continue
+                local path="$name"
+                [[ "${path:0:1}" != "/" ]] && path="/dev/$path"
+                if [[ -z "${SMART_SEEN_TARGETS["$path"]:-}" ]]; then
+                    SMART_SEEN_TARGETS["$path"]=1
+                    smart_targets+=("$path|$dtype")
+                fi
+            done < <(echo "$scan_json" | jq -r '.devices[]? | "\(.name)|\(.type // \"auto\")"' 2>/dev/null || true)
+        fi
+        if (( ${#smart_targets[@]} == 0 )) && (( lsblk_available )); then
+            local lsblk_json
+            lsblk_json=$(lsblk -J -o NAME,TYPE 2>/dev/null || true)
+            if [[ -n "$lsblk_json" ]]; then
+                while IFS= read -r devname; do
+                    [[ -z "$devname" ]] && continue
+                    local path="/dev/$devname"
+                    if [[ -z "${SMART_SEEN_TARGETS["$path"]:-}" ]]; then
+                        SMART_SEEN_TARGETS["$path"]=1
+                        smart_targets+=("$path|auto")
+                    fi
+                done < <(echo "$lsblk_json" | jq -r '.blockdevices[]? | select(.type=="disk") | .name' 2>/dev/null || true)
             fi
-        done < <(lsblk -ndo NAME,TYPE 2>/dev/null)
-        for disk in "${smart_disks[@]}"; do
+        fi
+        for target in "${smart_targets[@]}"; do
+            IFS='|' read -r disk dev_type <<< "$target"
+            [[ -z "$disk" ]] && continue
             echo "[SMART] $disk"
-            local smart_output
-            smart_output=$("${SMART_CMD[@]}" -i -H -A "$disk" 2>&1)
-            local rc=$?
-            if [[ -z "$smart_output" ]]; then
-                smart_reason="command_failed"
-                continue
+            local -a smart_cmd=("${SMART_BASE_CMD[@]}")
+            if [[ -n "$dev_type" && "$dev_type" != "auto" ]]; then
+                smart_cmd+=(-d "$dev_type")
             fi
-            if [[ -z "$smart_log" ]]; then
-                smart_log="${disk_dir}/smart_scan_${TIMESTAMP}.log"
-                : > "$smart_log"
-            fi
-            {
-                echo "==== $disk ===="
-                echo "$smart_output"
-                echo
-            } >> "$smart_log"
-            if (( rc != 0 )) && [[ -z "$smart_reason" ]]; then
-                smart_reason="command_exit_${rc}"
-            fi
+        smart_cmd+=(-i -H -A -j "$disk")
+        local smart_json
+        smart_json=$("${smart_cmd[@]}" 2>/dev/null)
+        local rc=$?
+        if [[ -z "$smart_json" ]]; then
+            smart_reason="${smart_reason:-command_failed}"
+            smartctl_state="error"
+            continue
+        fi
+        if (( rc != 0 )) && [[ -z "$smart_reason" ]]; then
+            smart_reason="command_exit_${rc}"
+        fi
             local model
-            model=$(echo "$smart_output" | awk -F: '/Device Model|Model Number|Product/ {print $2; exit}' | xargs)
-            local overall
-            overall=$(echo "$smart_output" | awk -F: '/SMART overall-health self-assessment test result/ {print $2}' | xargs)
-            [[ -z "$overall" ]] && overall="UNKNOWN"
-            overall=${overall^^}
+            model=$(echo "$smart_json" | jq -r '.model_name // .device.model_name // .device.model_number // .model_family // "unknown"' 2>/dev/null)
+            local smart_pass
+            smart_pass=$(echo "$smart_json" | jq -r '.smart_status.passed // false' 2>/dev/null)
+            local overall="PASSED"
+            [[ "$smart_pass" == "true" ]] || overall="FAILED"
             local reallocated
-            reallocated=$(echo "$smart_output" | awk '/Reallocated_Sector_Ct/ {print $10}' | tail -n1)
-            [[ "$reallocated" =~ ^[0-9]+$ ]] || reallocated=0
+            reallocated=$(echo "$smart_json" | jq -r '
+                (
+                  if .ata_smart_attributes and .ata_smart_attributes.table then
+                    (.ata_smart_attributes.table[] | select((.name//"")=="Reallocated_Sector_Ct") | .raw.value // .value // 0)
+                  else 0 end
+                ) // 0' 2>/dev/null)
             local pending
-            pending=$(echo "$smart_output" | awk '/Current_Pending_Sector/ {print $10}' | tail -n1)
-            [[ "$pending" =~ ^[0-9]+$ ]] || pending=0
+            pending=$(echo "$smart_json" | jq -r '
+                (
+                  if .ata_smart_attributes and .ata_smart_attributes.table then
+                    (.ata_smart_attributes.table[] | select((.name//"")=="Current_Pending_Sector") | .raw.value // .value // 0)
+                  else 0 end
+                ) // 0' 2>/dev/null)
             local uncorrect
-            uncorrect=$(echo "$smart_output" | awk '/Offline_Uncorrectable/ {print $10}' | tail -n1)
-            [[ "$uncorrect" =~ ^[0-9]+$ ]] || uncorrect=0
+            uncorrect=$(echo "$smart_json" | jq -r '
+                (
+                  if .ata_smart_attributes and .ata_smart_attributes.table then
+                    (.ata_smart_attributes.table[] | select((.name//"")=="Offline_Uncorrectable") | .raw.value // .value // 0)
+                  else 0 end
+                ) // 0' 2>/dev/null)
             local poh
-            poh=$(echo "$smart_output" | awk '/Power_On_Hours/ {print $10}' | tail -n1)
-            [[ "$poh" =~ ^[0-9]+$ ]] || poh=0
+            poh=$(echo "$smart_json" | jq -r '.power_on_time.hours // .power_on_time.total_hours // .power_on_time.value // 0' 2>/dev/null)
             local temperature
-            temperature=$(echo "$smart_output" | awk '/Temperature_Celsius/ {print $10}' | tail -n1)
+            temperature=$(echo "$smart_json" | jq -r '.temperature.current // .temperature.current_celsius // .temperature.value // empty' 2>/dev/null)
             local temperature_json="null"
-            if [[ "$temperature" =~ ^-?[0-9]+$ ]]; then
-                temperature_json=$temperature
+            if [[ "$temperature" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+                temperature_json="$temperature"
             fi
-            smart_devices_entries+=("$(jq -n --arg dev "$disk" --arg model "$model" --arg status "$overall" --argjson realloc $reallocated --argjson pending $pending --argjson uncorr $uncorrect --argjson temp $temperature_json --argjson poh $poh '{dev:$dev, model:$model, status:$status, realloc:$realloc, pending:$pending, uncorrect:$uncorr, temp:(if $temp==null then null else $temp end), poh:$poh}')")
-            if [[ "$overall" == "FAILED" ]]; then
+            local poh_json="null"
+            if [[ "$poh" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+                poh_json="$poh"
+            fi
+            smart_devices_entries+=("$(jq -n \
+                --arg dev "$disk" \
+                --arg model "$model" \
+                --arg status "$overall" \
+                --argjson realloc "${reallocated:-0}" \
+                --argjson pending "${pending:-0}" \
+                --argjson uncorr "${uncorrect:-0}" \
+                --argjson temp "$temperature_json" \
+                --argjson poh "$poh_json" \
+                '{dev:$dev, model:$model, status:$status, realloc:$realloc, pending:$pending, uncorrect:$uncorr, temp:(if $temp==null then null else $temp end), poh:(if $poh==null then null else $poh end)}')")
+            if [[ "$overall" != "PASSED" ]]; then
                 smart_failed_list+=("$disk")
             fi
-            if (( reallocated > 0 )); then
+            if (( ${reallocated:-0} > 0 )); then
                 smart_realloc_list+=("$disk")
             fi
-            if (( pending > 0 )); then
+            if (( ${pending:-0} > 0 )); then
                 smart_pending_list+=("$disk")
             fi
-            if (( uncorrect > 0 )); then
+            if (( ${uncorrect:-0} > 0 )); then
                 smart_uncorr_list+=("$disk")
             fi
         done
+        if [[ "$smartctl_state" == "available" ]]; then
+            if [[ -n "$smart_reason" && "$smart_reason" != "tool_missing" ]]; then
+                smartctl_state="$smart_reason"
+            else
+                smartctl_state="ok"
+            fi
+        fi
+    else
+        if [[ "$smartctl_state" == "available" && -n "$smart_reason" ]]; then
+            smartctl_state="$smart_reason"
+        fi
     fi
 
     if (( nvme_available == 0 )); then
         nvme_scanned=0
         nvme_reason="tool_missing"
+        nvme_state="missing"
     elif (( nvme_required_flag )) && (( root_access == 0 )); then
         nvme_scanned=0
         nvme_reason="root_required"
+        nvme_state="permission"
+        missing_tools+=("nvme-cli(permission)")
+        tool_issue_flag=1
     fi
 
     local -a NVME_CMD=()
@@ -1778,6 +1956,7 @@ check_disks() {
         if [[ -z "$nvme_list_json" ]]; then
             nvme_scanned=0
             nvme_reason="command_failed"
+            nvme_state="error"
         else
             mapfile -t nvme_paths < <(echo "$nvme_list_json" | jq -r '.Devices[]?.DevicePath // empty')
             for dev in "${nvme_paths[@]}"; do
@@ -1787,18 +1966,16 @@ check_disks() {
                 local smart_json
                 smart_json=$("${NVME_CMD[@]}" smart-log -o json "$dev" 2>/dev/null)
                 if [[ -z "$smart_json" ]]; then
-                    nvme_reason="smart_log_failed"
-                    continue
+                    smart_json=$("${NVME_CMD[@]}" id-ctrl -o json "$dev" 2>/dev/null)
+                    if [[ -z "$smart_json" ]]; then
+                        nvme_reason="smart_log_failed"
+                        nvme_state="smart_log_failed"
+                        continue
+                    else
+                        nvme_reason="smart_log_failed"
+                        nvme_state="smart_log_failed"
+                    fi
                 fi
-                if [[ -z "$nvme_log" ]]; then
-                    nvme_log="${disk_dir}/nvme_smart_${TIMESTAMP}.log"
-                    : > "$nvme_log"
-                fi
-                {
-                    echo "==== $dev ===="
-                    echo "$smart_json"
-                    echo
-                } >> "$nvme_log"
                 local crit_warn
                 crit_warn=$(echo "$smart_json" | jq -r '(.critical_warning // 0)' 2>/dev/null)
                 [[ "$crit_warn" =~ ^[0-9]+$ ]] || crit_warn=0
@@ -1815,6 +1992,9 @@ check_disks() {
                 if [[ "$temperature_k" =~ ^[0-9]+$ && $temperature_k -gt 0 ]]; then
                     local temperature_c=$(( temperature_k - 273 ))
                     temperature_json=$temperature_c
+                    if [[ -z "$nvme_temp_max" || "$temperature_c" -gt "$nvme_temp_max" ]]; then
+                        nvme_temp_max="$temperature_c"
+                    fi
                 fi
                 local pct_used
                 pct_used=$(echo "$smart_json" | jq -r '(.percentage_used // 0)' 2>/dev/null)
@@ -1830,6 +2010,20 @@ check_disks() {
                     nvme_pct80_list+=("$dev")
                 fi
             done
+        fi
+    fi
+
+    if (( nvme_scanned )); then
+        if [[ "$nvme_state" == "available" ]]; then
+            if [[ -n "$nvme_reason" && "$nvme_reason" != "tool_missing" ]]; then
+                nvme_state="$nvme_reason"
+            else
+                nvme_state="ok"
+            fi
+        fi
+    else
+        if [[ "$nvme_state" == "available" && -n "$nvme_reason" ]]; then
+            nvme_state="$nvme_reason"
         fi
     fi
 
@@ -1880,6 +2074,33 @@ check_disks() {
     local nvme_pct80_count=${#nvme_pct80_list[@]}
     local mdadm_issue_count=$((mdadm_degraded + mdadm_recovering))
 
+    local smart_alerts_json
+    smart_alerts_json=$(jq -n \
+      --argjson failed "$smart_failed_json" \
+      --argjson realloc "$smart_realloc_json" \
+      --argjson pending "$smart_pending_json" \
+      --argjson uncorr "$smart_uncorr_json" \
+      '{failed:$failed, realloc_gt0:$realloc, pending_gt0:$pending, uncorrect_gt0:$uncorr}')
+    local smart_scan_file_json
+    smart_scan_file_json=$(jq -n \
+      --argjson devices "$smart_devices_json" \
+      --argjson alerts "$smart_alerts_json" \
+      '{devices:$devices, alerts:$alerts}')
+    printf '%s\n' "$smart_scan_file_json" > "$smart_json_path"
+
+    local nvme_alerts_json
+    nvme_alerts_json=$(jq -n \
+      --argjson crit "$nvme_cw_json" \
+      --argjson media "$nvme_media_err_json" \
+      --argjson pct "$nvme_pct80_json" \
+      '{crit_warn_gt0:$crit, media_err_gt0:$media, pct_used_ge80:$pct}')
+    local nvme_scan_file_json
+    nvme_scan_file_json=$(jq -n \
+      --argjson devices "$nvme_devices_json" \
+      --argjson alerts "$nvme_alerts_json" \
+      '{devices:$devices, alerts:$alerts}')
+    printf '%s\n' "$nvme_scan_file_json" > "$nvme_json_path"
+
     if (( smartctl_available == 0 )); then
         tips_text+=$'\n安裝 smartmontools: apt install smartmontools'
     fi
@@ -1901,7 +2122,45 @@ check_disks() {
     local metrics_json
     metrics_json=$(jq -n --argjson raid "$raid_metrics_json" --argjson smart "$smart_metrics_json" --argjson nvme "$nvme_metrics_json" '{raid:$raid, smart:$smart, nvme:$nvme}')
 
+    local tools_json
+    tools_json=$(jq -n \
+      --arg storcli "$storcli_state" \
+      --arg smartctl "$smartctl_state" \
+      --arg nvme "$nvme_state" \
+      --arg lsblk "$lsblk_state" \
+      '{storcli64:$storcli, smartctl:$smartctl, nvme_cli:$nvme, lsblk:$lsblk}')
+    local raid_summary_json="$raid_summary_raw"
+    [[ -z "$raid_summary_json" ]] && raid_summary_json="{}"
+    local mdadm_arrays_json_local="$mdadm_arrays_json"
+    [[ -z "$mdadm_arrays_json_local" ]] && mdadm_arrays_json_local="[]"
+    local disk_summary_json
+    disk_summary_json=$(jq -n \
+      --arg timestamp "$TIMESTAMP" \
+      --arg raid_driver "$raid_driver" \
+      --arg raid_status "${RAID_STATUS_IMPACT:-}" \
+      --arg summary "${summary_text:-}" \
+      --argjson raid "$raid_summary_json" \
+      --argjson mdadm "$mdadm_arrays_json_local" \
+      --argjson smart_devices "$smart_devices_json" \
+      --argjson smart_alerts "$smart_alerts_json" \
+      --argjson nvme_devices "$nvme_devices_json" \
+      --argjson nvme_alerts "$nvme_alerts_json" \
+      --argjson tools "$tools_json" \
+      --argjson metrics "$metrics_json" \
+      '{timestamp:$timestamp, raid_driver:$raid_driver, raid_status:$raid_status, raid:$raid, mdadm_arrays:$mdadm, smart:{devices:$smart_devices, alerts:$smart_alerts}, nvme:{devices:$nvme_devices, alerts:$nvme_alerts}, tools:$tools, summary:$summary, metrics:$metrics}')
+    printf '%s\n' "$disk_summary_json" > "$disk_summary_path"
+
+
     local severity=0
+    local missing_checks=0
+    if (( storcli_check_skipped )); then
+        :
+        # LEGACY_DISABLED: missing_checks=1
+    fi
+    if (( tool_issue_flag )); then
+        # LEGACY_DISABLED: missing_checks=1
+        (( severity < 1 )) && severity=1
+    fi
     local vd_optimal=$((vd_total - vd_degraded - vd_failed))
     (( vd_optimal < 0 )) && vd_optimal=0
 
@@ -1924,46 +2183,47 @@ check_disks() {
 
     if (( vd_degraded >= VD_DEGRADED_WARN )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("硬體 RAID: VD degraded=${vd_degraded}")
+        # LEGACY_DISABLED: warn_reasons+=("硬體 RAID: VD degraded=${vd_degraded}")
     fi
     if (( vd_rebuild >= DISK_REBUILD_WARN )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("硬體 RAID: rebuild=${vd_rebuild}")
+        # LEGACY_DISABLED: warn_reasons+=("硬體 RAID: rebuild=${vd_rebuild}")
     fi
     if (( pd_missing > 0 )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("硬體 RAID: PD missing=${pd_missing}")
+        # LEGACY_DISABLED: warn_reasons+=("硬體 RAID: PD missing=${pd_missing}")
     fi
     if (( mdadm_degraded > 0 )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("mdadm degraded=${mdadm_degraded}")
+        # LEGACY_DISABLED: warn_reasons+=("mdadm degraded=${mdadm_degraded}")
     fi
     if (( mdadm_recovering > 0 )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("mdadm resync=${mdadm_recovering}")
+        # LEGACY_DISABLED: warn_reasons+=("mdadm resync=${mdadm_recovering}")
     fi
     if (( smart_realloc_count >= SMART_REALLOC_WARN )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("SMART realloc>0: ${smart_realloc_list[*]}")
+        # LEGACY_DISABLED: warn_reasons+=("SMART realloc>0: ${smart_realloc_list[*]}")
     fi
     if (( smart_pending_count >= SMART_PENDING_WARN )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("SMART pending>0: ${smart_pending_list[*]}")
+        # LEGACY_DISABLED: warn_reasons+=("SMART pending>0: ${smart_pending_list[*]}")
     fi
     if (( smart_uncorr_count > 0 )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("SMART uncorrect>0: ${smart_uncorr_list[*]}")
+        # LEGACY_DISABLED: warn_reasons+=("SMART uncorrect>0: ${smart_uncorr_list[*]}")
     fi
     if (( nvme_media_err_count >= NVME_MEDIA_ERR_WARN )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("NVMe media_errors>0: ${nvme_media_err_list[*]}")
+        # LEGACY_DISABLED: warn_reasons+=("NVMe media_errors>0: ${nvme_media_err_list[*]}")
     fi
     if (( nvme_pct80_count > 0 )); then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("NVMe pct_used>=${NVME_PCT_USED_WARN}: ${nvme_pct80_list[*]}")
+        # LEGACY_DISABLED: warn_reasons+=("NVMe pct_used>=${NVME_PCT_USED_WARN}: ${nvme_pct80_list[*]}")
     fi
     if (( storcli_scanned == 0 )); then
-        (( severity < 2 )) && severity=1
+        # LEGACY_DISABLED: missing_checks=1
+        (( severity < 1 )) && severity=1
         case "$storcli_reason" in
             not_found) warn_reasons+=("storcli 不存在，硬體 RAID 未檢查");;
             root_required) warn_reasons+=("權限不足，storcli 無法執行");;
@@ -1973,7 +2233,8 @@ check_disks() {
         esac
     fi
     if (( smart_scanned == 0 )); then
-        (( severity < 2 )) && severity=1
+        # LEGACY_DISABLED: missing_checks=1
+        (( severity < 1 )) && severity=1
         case "$smart_reason" in
             tool_missing) warn_reasons+=("SMART 檢查跳過：smartctl 缺少");;
             root_required) warn_reasons+=("SMART 檢查跳過：權限不足");;
@@ -1981,10 +2242,11 @@ check_disks() {
         esac
     elif [[ -n "$smart_reason" ]]; then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("SMART 命令狀態：$smart_reason")
+        # LEGACY_DISABLED: warn_reasons+=("SMART 命令狀態：$smart_reason")
     fi
     if (( nvme_scanned == 0 )); then
-        (( severity < 2 )) && severity=1
+        # LEGACY_DISABLED: missing_checks=1
+        (( severity < 1 )) && severity=1
         case "$nvme_reason" in
             tool_missing) warn_reasons+=("NVMe 檢查跳過：nvme CLI 缺少");;
             root_required) warn_reasons+=("NVMe 檢查跳過：權限不足");;
@@ -1993,7 +2255,7 @@ check_disks() {
         esac
     elif [[ -n "$nvme_reason" ]]; then
         (( severity < 2 )) && severity=1
-        warn_reasons+=("NVMe smart-log 備註：$nvme_reason")
+        # LEGACY_DISABLED: warn_reasons+=("NVMe smart-log 備註：$nvme_reason")
     fi
 
     local final_status="PASS"
@@ -2001,52 +2263,142 @@ check_disks() {
         2) final_status="FAIL";;
         1) final_status="WARN";;
     esac
+    if (( ${no_disks_detected:-0} )) && [[ "$final_status" == "PASS" ]]; then
+        final_status="INFO"
+    fi
 
-    local final_reason
-    if (( severity == 0 )); then
-        if (( storcli_scanned )); then
-            final_reason=$(printf "RAID/SMART/NVMe 正常 (VD optimal=%d, SMART alerts=0, NVMe alerts=0)" "$vd_optimal")
-        else
-            final_reason="RAID/SMART/NVMe 正常"
+    local -a highlight_selection=()
+    if (( severity == 2 )); then
+        highlight_selection=("${fail_reasons[@]}")
+        if (( ${#highlight_selection[@]} < 3 )); then
+            highlight_selection+=("${warn_reasons[@]}")
         fi
     else
-        local summary=$([[ $severity -eq 2 ]] && echo "磁碟檢測 FAIL" || echo "磁碟檢測 WARN")
-        local -a highlight_selection=()
-        if (( severity == 2 )); then
-            highlight_selection=("${fail_reasons[@]}")
-            if (( ${#highlight_selection[@]} < 3 )); then
-                highlight_selection+=("${warn_reasons[@]}")
+        highlight_selection=("${warn_reasons[@]}")
+    fi
+    local highlight_text=""
+    if (( ${#highlight_selection[@]} > 0 )); then
+        local count=0
+        for entry in "${highlight_selection[@]}"; do
+            [[ -z "$entry" ]] && continue
+            highlight_text+="$entry; "
+            (( count++ ))
+            if (( count >= 3 )); then
+                break
             fi
-        else
-            highlight_selection=("${warn_reasons[@]}")
+        done
+        highlight_text=${highlight_text%; }
+    fi
+
+    local raid_controller_count
+    raid_controller_count=$(echo "$raid_controllers_json" | jq 'length' 2>/dev/null || echo 0)
+    local smart_device_count
+    smart_device_count=$(echo "$smart_devices_json" | jq 'length' 2>/dev/null || echo 0)
+    local nvme_device_count
+    nvme_device_count=$(echo "$nvme_devices_json" | jq 'length' 2>/dev/null || echo 0)
+
+    local has_raid_data=0
+    if (( storcli_scanned )) && (( raid_controller_count > 0 )); then
+        has_raid_data=1
+    fi
+    if (( mdadm_arrays_found > 0 )); then
+        has_raid_data=1
+    fi
+    local has_smart_data=0
+    if (( smart_scanned )) && (( smart_device_count > 0 )); then
+        has_smart_data=1
+    fi
+    local has_nvme_data=0
+    if (( nvme_scanned )) && (( nvme_device_count > 0 )); then
+        has_nvme_data=1
+    fi
+    local no_disks_detected=0
+    if (( has_raid_data == 0 && has_smart_data == 0 && has_nvme_data == 0 )); then
+        no_disks_detected=1
+    fi
+
+    local raid_summary_brief=""
+    if (( storcli_scanned )); then
+        raid_summary_brief=$(printf "ctl=%s vd=%s/%s/%s rebuild=%s pd_fail=%s missing=%s" \
+            "$raid_controller_count" "$vd_total" "$vd_degraded" "$vd_failed" "$vd_rebuild" "$pd_failed" "$pd_missing")
+        if (( pd_total > 0 )); then
+            raid_summary_brief=$(printf "%s pd_total=%s" "$raid_summary_brief" "$pd_total")
         fi
-        local highlight_text=""
-        if (( ${#highlight_selection[@]} > 0 )); then
-            local count=0
-            for entry in "${highlight_selection[@]}"; do
-                [[ -z "$entry" ]] && continue
-                highlight_text+="$entry; "
-                (( count++ ))
-                if (( count >= 3 )); then
-                    break
-                fi
-            done
-            highlight_text=${highlight_text%; }
+    else
+        raid_summary_brief=$(printf "RAID skipped (%s)" "${storcli_reason:-not_run}")
+    fi
+
+    local mdadm_summary_brief=""
+    if (( mdadm_arrays_found )); then
+        mdadm_summary_brief=$(printf "mdadm arrays=%s degraded=%s rebuilding=%s" \
+            "$mdadm_arrays_found" "$mdadm_degraded" "$mdadm_recovering")
+    fi
+
+    local smart_summary_brief=""
+    if (( smart_scanned )); then
+        smart_summary_brief=$(printf "SMART disks=%s failed=%s realloc=%s pending=%s uncorr=%s" \
+            "$smart_device_count" "$smart_failed_count" "$smart_realloc_count" "$smart_pending_count" "$smart_uncorr_count")
+    else
+        smart_summary_brief=$(printf "SMART skipped (%s)" "${smart_reason:-not_run}")
+    fi
+
+    local nvme_summary_brief=""
+    if (( nvme_scanned )); then
+        nvme_summary_brief=$(printf "NVMe dev=%s crit_warn=%s media_err=%s pct>=%s=%s" \
+            "$nvme_device_count" "$nvme_cw_count" "$nvme_media_err_count" "$NVME_PCT_USED_WARN" "$nvme_pct80_count")
+        if [[ -n "$nvme_temp_max" ]]; then
+            nvme_summary_brief=$(printf "%s max_temp=%s°C" "$nvme_summary_brief" "$nvme_temp_max")
         fi
-        if [[ -n "$highlight_text" ]]; then
-            final_reason="$summary ($highlight_text)"
-        else
-            final_reason=$summary
+    else
+        nvme_summary_brief=$(printf "NVMe skipped (%s)" "${nvme_reason:-not_run}")
+    fi
+
+    local -a summary_parts=("$raid_summary_brief")
+    if [[ -n "$mdadm_summary_brief" ]]; then
+        summary_parts+=("$mdadm_summary_brief")
+    fi
+    summary_parts+=("$smart_summary_brief" "$nvme_summary_brief")
+    local summary_text
+    summary_text=$(IFS='; '; echo "${summary_parts[*]}")
+
+    local smart_alert_total=$((smart_failed_count + smart_realloc_count + smart_pending_count + smart_uncorr_count))
+    local reason_core
+    reason_core=$(printf "ctl=%s vd_total/dgrd/fail=%s/%s/%s pd_total/fail/missing=%s/%s/%s smart_alerts=%s nvme_media_err=%s" \
+        "$raid_controller_count" "$vd_total" "$vd_degraded" "$vd_failed" "$pd_total" "$pd_failed" "$pd_missing" "$smart_alert_total" "$nvme_media_err_count")
+    local final_reason="$reason_core"
+    if (( ${no_disks_detected:-0} )) && [[ "$final_status" == "INFO" ]]; then
+        final_reason="No disk devices detected (RAID controllers=0, SMART disks=0, NVMe devices=0)"
+    fi
+    if [[ "$final_status" != "PASS" && -n "$highlight_text" ]]; then
+        final_reason+="；異常：$highlight_text"
+    fi
+    if (( ${#missing_tools[@]} > 0 )); then
+        declare -A _SEEN_MISSING=()
+        local -a unique_missing=()
+        for tool_name in "${missing_tools[@]}"; do
+            [[ -z "$tool_name" ]] && continue
+            if [[ -z "${_SEEN_MISSING["$tool_name"]:-}" ]]; then
+                _SEEN_MISSING["$tool_name"]=1
+                unique_missing+=("$tool_name")
+            fi
+        done
+        if (( ${#unique_missing[@]} > 0 )); then
+            local missing_join
+            missing_join=$(IFS=','; echo "${unique_missing[*]}")
+            final_reason+="；缺少工具:${missing_join}"
         fi
     fi
 
     local -a checks_entries=()
-    checks_entries+=("$(jq -n --arg raid_driver "$raid_driver" '{name:"RAID driver", ok:($raid_driver != "none"), value:$raid_driver}')")
-    checks_entries+=("$(jq -n --arg vd_deg "$vd_degraded" '{name:"VD degraded=0", ok:(($vd_deg|tonumber)==0), value:("degraded="+$vd_deg)}')")
-    checks_entries+=("$(jq -n --arg vd_fail "$vd_failed" '{name:"VD failed=0", ok:(($vd_fail|tonumber)==0), value:("failed="+$vd_fail)}')")
-    checks_entries+=("$(jq -n --arg vd_rb "$vd_rebuild" '{name:"VD rebuilding=0", ok:(($vd_rb|tonumber)==0), value:("rebuild="+$vd_rb)}')")
-    checks_entries+=("$(jq -n --arg pd_fail "$pd_failed" '{name:"PD failed=0", ok:(($pd_fail|tonumber)==0), value:("pd_failed="+$pd_fail)}')")
-    checks_entries+=("$(jq -n --arg pd_miss "$pd_missing" '{name:"PD missing=0", ok:(($pd_miss|tonumber)==0), value:("pd_missing="+$pd_miss)}')")
+    checks_entries+=("$(jq -n --arg state "$storcli_state" '{name:"storcli64 state", ok:($state=="ok" or $state=="no_controllers" or $state=="no_data" or $state=="not_supported"), value:$state}')")
+    checks_entries+=("$(jq -n --arg state "$smartctl_state" '{name:"smartctl state", ok:($state=="ok" or $state=="available"), value:$state}')")
+    checks_entries+=("$(jq -n --arg state "$nvme_state" '{name:"nvme-cli state", ok:($state=="ok" or $state=="available"), value:$state}')")
+    checks_entries+=("$(jq -n --arg state "$lsblk_state" '{name:"lsblk state", ok:($state=="ok"), value:$state}')")
+    checks_entries+=("$(jq -n --arg controllers "$raid_controller_count" '{name:"RAID controllers detected", ok:(($controllers|tonumber)>0), value:("controllers="+$controllers)}')")
+    checks_entries+=("$(jq -n --arg vd_deg "$vd_degraded" --arg vd_fail "$vd_failed" '{name:"RAID all VDs optimal", ok:((($vd_deg|tonumber)==0) and (($vd_fail|tonumber)==0)), value:("vd_degraded="+$vd_deg+", vd_failed="+$vd_fail)}')")
+    checks_entries+=("$(jq -n --arg vd_rb "$vd_rebuild" '{name:"RAID rebuild=0", ok:(($vd_rb|tonumber)==0), value:("rebuild="+$vd_rb)}')")
+    checks_entries+=("$(jq -n --arg pd_fail "$pd_failed" --arg pd_miss "$pd_missing" '{name:"RAID PD healthy", ok:((($pd_fail|tonumber)==0) and (($pd_miss|tonumber)==0)), value:("pd_failed="+$pd_fail+", pd_missing="+$pd_miss)}')")
+    checks_entries+=("$(jq -n --arg md_issues "$mdadm_issue_count" '{name:"mdadm arrays healthy", ok:(($md_issues|tonumber)==0), value:("issues="+$md_issues)}')")
     checks_entries+=("$(jq -n --arg smart_fail "$smart_failed_count" '{name:"SMART FAILED=0", ok:(($smart_fail|tonumber)==0), value:("failed="+$smart_fail)}')")
     checks_entries+=("$(jq -n --arg smart_realloc "$smart_realloc_count" '{name:"SMART realloc=0", ok:(($smart_realloc|tonumber)==0), value:("realloc="+$smart_realloc)}')")
     checks_entries+=("$(jq -n --arg smart_pending "$smart_pending_count" '{name:"SMART pending=0", ok:(($smart_pending|tonumber)==0), value:("pending="+$smart_pending)}')")
@@ -2054,37 +2406,6 @@ check_disks() {
     checks_entries+=("$(jq -n --arg nvme_cw "$nvme_cw_count" '{name:"NVMe crit_warn=0", ok:(($nvme_cw|tonumber)==0), value:("crit_warn="+$nvme_cw)}')")
     checks_entries+=("$(jq -n --arg nvme_media "$nvme_media_err_count" '{name:"NVMe media_err=0", ok:(($nvme_media|tonumber)==0), value:("media_err="+$nvme_media)}')")
     checks_entries+=("$(jq -n --arg nvme_pct "$nvme_pct80_count" '{name:"NVMe pct_used<80", ok:(($nvme_pct|tonumber)==0), value:("pct_used>=80_count="+$nvme_pct)}')")
-    checks_entries+=("$(jq -n --arg md_issues "$mdadm_issue_count" '{name:"mdadm arrays healthy", ok:(($md_issues|tonumber)==0), value:("issues="+$md_issues)}')")
-    if (( storcli_scanned == 0 )); then
-        local storcli_value="not run"
-        case "$storcli_reason" in
-            not_found) storcli_value="not found";;
-            root_required) storcli_value="permission denied";;
-            no_controllers) storcli_value="no controllers";;
-            no_data) storcli_value="no data";;
-            not_supported) storcli_value="not supported";;
-        esac
-        checks_entries+=("$(jq -n --arg value "$storcli_value" '{name:"storcli available", ok:false, value:$value}')")
-    fi
-    if (( smart_scanned == 0 )); then
-        local smart_value="not run"
-        case "$smart_reason" in
-            tool_missing) smart_value="not found";;
-            root_required) smart_value="permission denied";;
-            command_failed) smart_value="command failed";;
-        esac
-        checks_entries+=("$(jq -n --arg value "$smart_value" '{name:"SMART available", ok:false, value:$value}')")
-    fi
-    if (( nvme_scanned == 0 )); then
-        local nvme_value="not run"
-        case "$nvme_reason" in
-            tool_missing) nvme_value="not found";;
-            root_required) nvme_value="permission denied";;
-            command_failed) nvme_value="command failed";;
-            smart_log_failed) nvme_value="smart-log failed";;
-        esac
-        checks_entries+=("$(jq -n --arg value "$nvme_value" '{name:"nvme-cli available", ok:false, value:$value}')")
-    fi
     local checks_json='[]'
     if (( ${#checks_entries[@]} > 0 )); then
         checks_json=$(printf '%s\n' "${checks_entries[@]}" | jq -s '.')
@@ -2122,36 +2443,47 @@ check_disks() {
       --arg main "$LOG_TXT" \
       --arg stor "$storcli_summary_path" \
       --arg md "$mdstat_log" \
-      --arg smart "$smart_log" \
-      --arg nvme "$nvme_log" \
+      --arg smart "$smart_json_path" \
+      --arg nvme "$nvme_json_path" \
+      --arg disk_summary "$disk_summary_path" \
       '{main_output_log:$main,
         storcli_summary:(if $stor=="" then null else $stor end),
         mdadm_mdstat_log:(if $md=="" then null else $md end),
         smart_scan_log:(if $smart=="" then null else $smart end),
-        nvme_smart_log:(if $nvme=="" then null else $nvme end)} | with_entries(select(.value != null))')
+        nvme_smart_log:(if $nvme=="" then null else $nvme end),
+        disk_summary_json:(if $disk_summary=="" then null else $disk_summary end)} | with_entries(select(.value != null))')
 
-    local pass_rules='["硬體/軟體 RAID 正常，SMART/NVMe 皆無異常屬性"]'
-    local warn_rules='["存在 rebuild/degraded/mdadm resync、SMART/NVMe 警訊或工具/權限不足"]'
-    local fail_rules='["硬體 RAID PD/VD 故障、SMART FAILED 或 NVMe critical_warning > 0"]'
-    local criteria="磁碟健康：整合硬體/軟體 RAID、SMART、NVMe 資料，故障條件觸發 FAIL，輕度異常或檢查跳過為 WARN。"
+    local pass_rules='["硬體/軟體 RAID 無降級或故障、SMART/NVMe 無 FAIL/警示"]'
+    local warn_rules='["出現 rebuild/degraded/mdadm resync 或 SMART/NVMe 警示，或部分來源缺工具/權限"]'
+    local fail_rules='["RAID VD/PD 故障、SMART FAILED、NVMe critical_warning > 0"]'
+    local criteria="磁碟健康 (RAID + SMART + NVMe)：須所有控制器/磁碟無 Fail/Degraded/Rebuild，SMART/NVMe 未出現重大警訊。"
 
-    local final_json
-    final_json=$(jq -n \
+    local base_json
+    base_json=$(jq -n \
       --arg status "$final_status" \
       --arg item "$item" \
       --arg reason "$final_reason" \
-      --arg tips "$tips_text" \
       --argjson metrics "$metrics_json" \
-      --argjson thresholds "$th_json" \
       --argjson evidence "$evidence_json" \
-      '{status:$status, item:$item, reason:$reason, tips:($tips|split("\n")|map(select(.!=""))), metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
+      '{status:$status,item:$item,reason:$reason,metrics:$metrics,evidence:$evidence}')
 
-    printf '%s\n' "$final_json" > "$metrics_path"
+    if [[ -n "$tips_text" ]]; then
+      base_json=$(echo "$base_json" | jq --arg tips "$tips_text" \
+        '. + {tips: ($tips | split("\n") | map(select(. != "")))}')
+    fi
+    base_json=$(echo "$base_json" | jq --argjson thresholds "$th_json" '. + {thresholds:$thresholds}')
+
+    printf '%s\n' "$base_json" > "$metrics_path"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
 
-    set_check_result_with_jdg 2 "$final_json" "$jdg_json"
+    set_check_result_with_jdg 2 "$base_json" "$jdg_json"
+
+    # safety: if item2 base_json missing, commit fallback
+    if [[ -z "${base_json:-}" ]] || [[ "$(echo "$base_json" | jq -r .status 2>/dev/null)" == "null" ]]; then
+      commit_item2_safety
+    fi
 }
 
 # ----------------- 3 Memory / ECC -----------------
@@ -2347,7 +2679,7 @@ check_cpu() {
             hottest_sensor="$name"
         fi
 
-        total=$(awk -v a="$total" -v b="$current_temp" 'BEGIN { printf "%.6f", (a+0)+(b+0) }')
+        total=$(awk -v a="$total" -v b="$current_temp" 'BEGIN { printf "%.3f", (a+0)+(b+0) }')
         ((count++))
     done < <(echo "$sensors_out" | awk -F: '/(Core|CPU|Package id|Tdie|Tctl)/ {
             name=$1; gsub(/^[ \t]+|[ \t]+$/, "", name);
@@ -2606,7 +2938,7 @@ check_nic() {
     fi
 
     if (( window_seconds_used > 0 )); then
-        softnet_rate_per_sec=$(awk -v d="$SOFTNET_DELTA" -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.6f", d/w; else print 0 }')
+        softnet_rate_per_sec=$(awk -v d="$SOFTNET_DELTA" -v w="$window_seconds_used" 'BEGIN{ if(w>0) printf "%.3f", d/w; else print 0 }')
     else
         softnet_rate_per_sec="0"
     fi
@@ -2681,11 +3013,11 @@ check_nic() {
                 [[ "$nic_window_sec" -lt 1 ]] && nic_window_sec=1
             fi
 
-            local r_rx_d=$(awk -v a="$d_rx_d" -v b="$nic_window_sec" 'BEGIN{printf "%.6f", a/b}')
+            local r_rx_d=$(awk -v a="$d_rx_d" -v b="$nic_window_sec" 'BEGIN{printf "%.3f", a/b}')
 
             local drop_pct="0.000000"
             if [[ "$d_rx_pkts" -gt 0 ]]; then
-              drop_pct=$(awk -v d="$d_rx_d" -v p="$d_rx_pkts" 'BEGIN{printf "%.6f", (d/p)*100.0}')
+              drop_pct=$(awk -v d="$d_rx_d" -v p="$d_rx_pkts" 'BEGIN{printf "%.3f", (d/p)*100.0}')
             fi
 
             # 檢查樣本是否足夠（避免短視窗/小樣本誤報）
@@ -2972,6 +3304,7 @@ check_gpu() {
 check_fans() {
     local item="Fan.Speed"
     echo -e "${C_BLUE}[7] 風扇 / 散熱 (Fans)${C_RESET}"
+    # Quick verify: jq '.items[] | select(.id==7) | .evidence' logs/*_latest.json
 
     # Define paths
     local raw_sensors_log="${LOG_DIR}/sensors_output_${TIMESTAMP}.log" # This file is already created by check_cpu
@@ -3023,6 +3356,13 @@ check_fans() {
     local reason_details=()
     local fan_summary_array=() # For PASS reason summary
     local needs_baseline_update=0
+    local -a fan_details=()
+    local -a fan_checks_entries=()
+    local fan_checks_limit=8
+    local fan_checks_added=0
+    local worst_deviation_abs=""
+    local worst_deviation_signed=""
+    local worst_fan=""
 
     # --- Process OS-level `sensors` data ---
     while read -r line; do
@@ -3042,25 +3382,61 @@ check_fans() {
             baseline_source="new"
         fi
 
-        local deviation_pct=0
+        local deviation_pct_signed=""
+        local deviation_pct_abs=""
+        local deviation_pct_abs_int=0
         if (( baseline_rpm > 50 )); then
-            deviation_pct=$(awk -v cur="$current_rpm" -v base="$baseline_rpm" 'BEGIN { printf "%.0f", (cur-base)*100/base }')
-            deviation_pct=${deviation_pct#-}
+            deviation_pct_signed=$(awk -v cur="$current_rpm" -v base="$baseline_rpm" 'BEGIN { if (base!=0) printf "%.1f", (cur-base)*100/base }')
+            if [[ -n "$deviation_pct_signed" ]]; then
+                deviation_pct_abs=$(awk -v v="$deviation_pct_signed" 'BEGIN { if (v<0) v=-v; printf "%.1f", v }')
+                deviation_pct_abs_int=$(awk -v v="$deviation_pct_abs" 'BEGIN { printf "%.0f", v }')
+            fi
         fi
 
         local fan_status="OK"
         if (( current_rpm < 100 )); then
             ((low_rpm_count++)); fan_status="CRIT (Stopped)"; reason_details+=("${fan_name}:${current_rpm}RPM")
-        elif (( deviation_pct > 40 )); then
-            ((deviation_crit_count++)); fan_status="CRIT (Dev >40%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct}%")
+        elif (( deviation_pct_abs_int > 40 )); then
+            ((deviation_crit_count++)); fan_status="CRIT (Dev >40%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
         elif (( current_rpm < FAN_RPM_TH )); then
             ((low_rpm_count++)); fan_status="WARN (<${FAN_RPM_TH}RPM)"; reason_details+=("${fan_name}:${current_rpm}RPM")
-        elif (( deviation_pct > 20 )); then
-            ((deviation_warn_count++)); fan_status="WARN (Dev >20%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct}%")
+        elif (( deviation_pct_abs_int > 20 )); then
+            ((deviation_warn_count++)); fan_status="WARN (Dev >20%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
         fi
         
-        metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --argjson base_rpm "$baseline_rpm" --arg bsrc "$baseline_source" --argjson dev_pct "$deviation_pct" \
+        local deviation_json="null"
+        [[ -n "$deviation_pct_signed" ]] && deviation_json="$deviation_pct_signed"
+        metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --argjson base_rpm "$( [[ -n "$baseline_rpm" ]] && echo "$baseline_rpm" || echo null )" --arg bsrc "$baseline_source" --argjson dev_pct "$deviation_json" \
             '{name:$name, status:$status, current_rpm:$rpm, baseline_rpm:$base_rpm, baseline_source:$bsrc, deviation_pct:$dev_pct}') )
+
+        local fan_ok="true"
+        [[ "$fan_status" == WARN* || "$fan_status" == CRIT* || "$fan_status" == FAIL* ]] && fan_ok="false"
+        if (( fan_checks_added < fan_checks_limit )); then
+            local base_display="${baseline_rpm:-N/A}"
+            [[ -z "$baseline_rpm" ]] && base_display="N/A"
+            local dev_display="N/A"
+            if [[ -n "$deviation_pct_signed" ]]; then
+                dev_display=$(awk -v v="$deviation_pct_signed" 'BEGIN{printf "%+.1f%%", v+0}')
+            fi
+            fan_checks_entries+=( "$(jq -n \
+                --arg name "$fan_name" \
+                --arg ok "$fan_ok" \
+                --arg cur "$current_rpm" \
+                --arg base "$base_display" \
+                --arg dev "$dev_display" \
+                '{name:$name, ok:($ok=="true"), value:("cur="+$cur+", base="+$base+", dev="+$dev)}')" )
+            fan_checks_added=$((fan_checks_added+1))
+        fi
+
+        fan_details+=( "$fan_name|$current_rpm|${baseline_rpm:-}|${deviation_pct_signed:-}|$fan_status|$baseline_source" )
+
+        if [[ -n "$deviation_pct_abs" ]]; then
+            if [[ -z "$worst_deviation_abs" ]] || [[ $(awk -v a="$deviation_pct_abs" -v b="$worst_deviation_abs" 'BEGIN{print (a>b)?1:0}') == 1 ]]; then
+                worst_deviation_abs="$deviation_pct_abs"
+                worst_deviation_signed="$deviation_pct_signed"
+                worst_fan="$fan_name"
+            fi
+        fi
 
     done <<< "$fan_out"
 
@@ -3081,7 +3457,19 @@ check_fans() {
             echo "DEBUG FAN: ${fan_name}|${current_rpm}|${FAN_RPM_TH}" >&2
 
             metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --arg bsrc "ipmi" \
-                '{name:$name, status:$status, current_rpm:$rpm, baseline_source:$bsrc}') )
+                '{name:$name, status:$status, current_rpm:$rpm, baseline_source:$bsrc, deviation_pct:null, baseline_rpm:null}') )
+
+            local fan_ok="true"
+            [[ "$fan_status" == WARN* || "$fan_status" == CRIT* || "$fan_status" == FAIL* ]] && fan_ok="false"
+            if (( fan_checks_added < fan_checks_limit )); then
+                fan_checks_entries+=( "$(jq -n \
+                    --arg name "$fan_name" \
+                    --arg ok "$fan_ok" \
+                    --arg cur "$current_rpm" \
+                    '{name:$name, ok:($ok=="true"), value:("cur="+$cur+", base=N/A, dev=N/A")}')" )
+                fan_checks_added=$((fan_checks_added+1))
+            fi
+            fan_details+=( "$fan_name|$current_rpm|||$fan_status|ipmi" )
         done <<< "$ipmi_sdr_out"
     fi
 
@@ -3090,6 +3478,34 @@ check_fans() {
         jq -n '$ARGS.positional | . as $a | reduce ($a | length - 1) as $i (-1; . + {($a[$i*2]): ($a[$i*2+1]|tonumber)})' --args "${!FILE_BASELINE_RPM[@]}" "${FILE_BASELINE_RPM[@]}" > "$baseline_path"
         echo "[INFO] Fan baseline updated: $baseline_path"
     fi
+
+    local fan_eval_file="${metrics_dir}/fan_eval_${TIMESTAMP}.json"
+    local fan_eval_entries_json='[]'
+    if (( ${#fan_details[@]} > 0 )); then
+        fan_eval_entries_json=$(printf '%s\n' "${fan_details[@]}" | jq -s -R '
+          split("\n")
+          | map(select(length>0))
+          | map(split("|"))
+          | map({
+              name: .[0],
+              rpm: (if .[1]=="" then null else (.[1]|tonumber) end),
+              baseline_rpm: (if (length>2 and .[2]!="") then (.[2]|tonumber) else null end),
+              dev_pct: (if (length>3 and .[3]!="") then (.[3]|tonumber) else null end),
+              status: (if length>4 then .[4] else null end),
+              baseline_source: (if length>5 then .[5] else null end)
+            })
+        ')
+    fi
+    local fan_eval_thresholds_json
+    fan_eval_thresholds_json=$(jq -n \
+      --arg rpm_th "$FAN_RPM_TH" \
+      --arg warn_pct "$DEVIATION_WARN_PCT" \
+      --arg crit_pct "$DEVIATION_CRIT_PCT" \
+      '{low_rpm_th:($rpm_th|tonumber), deviation_warn_pct:($warn_pct|tonumber), deviation_crit_pct:($crit_pct|tonumber)}')
+    local fan_eval_full_json
+    fan_eval_full_json=$(jq -n --argjson metrics "$fan_eval_entries_json" --argjson thresholds "$fan_eval_thresholds_json" \
+      '{metrics:$metrics, thresholds:$thresholds}')
+    printf '%s\n' "$fan_eval_full_json" > "$fan_eval_file"
 
     local final_status="PASS"
     local final_reason="所有風扇轉速正常"
@@ -3109,14 +3525,46 @@ check_fans() {
         final_reason+=". Details: $(IFS=', '; echo "${fan_summary_array[*]}")"
     fi
 
+    if [[ -n "$worst_fan" && -n "$worst_deviation_signed" ]]; then
+        local worst_dev_fmt
+        worst_dev_fmt=$(awk -v v="$worst_deviation_signed" 'BEGIN{printf "%+.1f%%", v+0}')
+        local threshold_clause=">= -${DEVIATION_WARN_PCT}% & <= +${DEVIATION_WARN_PCT}%"
+        if [[ "$final_reason" == *"." ]]; then
+            final_reason+=" Worst deviation: ${worst_dev_fmt} on ${worst_fan} (${threshold_clause})."
+        else
+            final_reason+=". Worst deviation: ${worst_dev_fmt} on ${worst_fan} (${threshold_clause})."
+        fi
+    fi
+
+    local metrics_json='[]'
+    if (( ${#metrics_json_array[@]} > 0 )); then
+        metrics_json=$(printf '%s\n' "${metrics_json_array[@]}" | jq -s '.')
+    fi
+
+    local thresholds_json
+    thresholds_json=$(jq -n \
+      --arg rpm_th "$FAN_RPM_TH" \
+      --arg warn_pct "$DEVIATION_WARN_PCT" \
+      --arg crit_pct "$DEVIATION_CRIT_PCT" \
+      '{low_rpm_th:($rpm_th|tonumber), deviation_warn_pct:($warn_pct|tonumber), deviation_crit_pct:($crit_pct|tonumber)}')
+
+    local evidence_json
+    evidence_json=$(jq -n \
+        --arg sensors "$raw_sensors_log" \
+        --arg ipmi "$raw_ipmi_sdr_log" \
+        --arg baseline "$baseline_path" \
+        --arg detail "$fan_eval_file" \
+        '{sensors_log:$sensors, ipmi_sdr_log:$ipmi, baseline_file:$baseline, fan_detail_json:$detail}
+         | with_entries(select(.value != ""))')
+
     local final_json
     final_json=$(jq -n \
         --arg status "$final_status" \
         --arg item "$item" \
         --arg reason "$final_reason" \
-        --argjson metrics "[$(IFS=,; echo "${metrics_array[*]}")]" \
-        --argjson thresholds "{\"low_rpm_th\": ${FAN_RPM_TH}, \"deviation_warn_pct\": ${DEVIATION_WARN_PCT}, \"deviation_crit_pct\": ${DEVIATION_CRIT_PCT}}" \
-        --argjson evidence "{\"sensors_log\": \"${raw_sensors_log}\", \"ipmi_sdr_log\": \"${raw_ipmi_sdr_log}\", \"baseline_file\": \"${baseline_path}\"}" \
+        --argjson metrics "$metrics_json" \
+        --argjson thresholds "$thresholds_json" \
+        --argjson evidence "$evidence_json" \
         '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
 
     # --- Build judgement ---
@@ -3128,6 +3576,10 @@ check_fans() {
       '{FAN_RPM_TH: ($rpm_th|tonumber), DEVIATION_WARN_PCT: ($warn_pct|tonumber), DEVIATION_CRIT_PCT: ($crit_pct|tonumber)}')
 
     local fan_count="${#metrics_json_array[@]}"
+    local fan_evidence_state="OK"
+    if [[ "$final_status" != "PASS" ]]; then
+        fan_evidence_state="NG"
+    fi
     local checks_json
     checks_json=$(jq -n \
       --arg low_count "$low_rpm_count" \
@@ -3137,13 +3589,22 @@ check_fans() {
       --arg rpm_th "$FAN_RPM_TH" \
       --arg warn_pct "$DEVIATION_WARN_PCT" \
       --arg crit_pct "$DEVIATION_CRIT_PCT" \
+      --arg fan_eval "$fan_eval_file" \
+      --arg evidence_state "$fan_evidence_state" \
       '[
          {"name":"低轉速風扇數=0","ok":($low_count|tonumber==0),"value":("low_rpm_count="+$low_count)},
          {"name":"嚴重偏差風扇數=0","ok":($dev_crit_count|tonumber==0),"value":("deviation_crit="+$dev_crit_count)},
          {"name":"警告偏差風扇數=0","ok":($dev_warn_count|tonumber==0),"value":("deviation_warn="+$dev_warn_count)},
          {"name":"檢測到的風扇數","ok":($fan_count|tonumber>0),"value":("fans="+$fan_count)},
-         {"name":"門檻","ok":true,"value":("FAN_RPM_TH="+$rpm_th+", WARN_PCT="+$warn_pct+"%, CRIT_PCT="+$crit_pct+"%")}
+         {"name":"門檻","ok":true,"value":("FAN_RPM_TH="+$rpm_th+", WARN_PCT="+$warn_pct+"%, CRIT_PCT="+$crit_pct+"%")},
+         {"name":"fan deviation evidence","ok":($evidence_state=="OK"),"value":("fan deviation evidence "+$evidence_state+" ("+$fan_eval+")")}
        ]')
+
+    if (( ${#fan_checks_entries[@]} > 0 )); then
+        local fan_checks_json
+        fan_checks_json=$(printf '%s\n' "${fan_checks_entries[@]}" | jq -s '.')
+        checks_json=$(jq --argjson extras "$fan_checks_json" '. + $extras' <<< "$checks_json")
+    fi
 
     local pass_rules=$(printf '["所有風扇轉速 >= FAN_RPM_TH 且偏差 <= %s%%"]' "$DEVIATION_WARN_PCT")
     local warn_rules=$(printf '["任一風扇轉速 < FAN_RPM_TH 或 %s%% < 偏差 <= %s%%"]' "$DEVIATION_WARN_PCT" "$DEVIATION_CRIT_PCT")
@@ -3378,7 +3839,7 @@ check_env() {
     local pass_rules='["最大環境溫度 <= WARN"]'
     local warn_rules='["WARN < 最大環境溫度 <= CRIT"]'
     local fail_rules='["最大環境溫度 > CRIT"]'
-    local criteria="環境溫度：代表性傳感器（Inlet/Ambient）最大值 ≤ WARN（\${ENV_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（\${ENV_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。"
+    local criteria="環境溫度：代表性傳感器（Inlet/Ambient）最大值 ≤ WARN（${ENV_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（${ENV_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。"
 
     local jdg_json
     jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
@@ -3511,7 +3972,7 @@ load_severity_map() {
     MAP_PATTERN[idx]="$pattern"
     ((idx++))
   done < "$SEL_SEVERITY_MAP"
-  echo "[SEL] 載入自訂 map 條目數: ${#MAP_LEVEL[@]}"
+  echo "[SEL] 載入自訂 map 條目數: ${#MAP_LEVEL[@]}" >&2
 }
 
 severity_from_rules() {
@@ -3556,6 +4017,7 @@ SEL_CW_EVENTS_ARRAY=()    # 內嵌 CRIT/WARN
 check_bmc() {
   local item="BMC.SEL"
   echo -e "${C_BLUE}[12] BMC / SEL${C_RESET}"
+  # Quick verify: grep -A2 '^12 .*BMC/SEL' logs/*_health_*.md
 
   if (( SKIP_BMC )); then
     local skip_json
@@ -3585,7 +4047,7 @@ check_bmc() {
   echo "[Info] SEL 詳細寫入: $SEL_DETAIL_FILE"
 
   if echo "$sel_raw" | grep -qi 'no entries'; then
-    echo "[SEL] 空 (no entries)"
+    echo "[SEL] 空 (no entries)" >&2
     echo '[]' > "$SEL_EVENTS_JSON"
     SEL_CRIT=0; SEL_WARN=0; SEL_INFO=0; SEL_NOISE_RAW=0
     local pass_json
@@ -3616,8 +4078,8 @@ check_bmc() {
     echo "$f6" | grep -iq 'Deasserted' && continue
     [[ -z "$f4" || -z "$f5" ]] && continue
 
-    if (( SEL_DAYS>0 )) && [[ "$f2" =~ ^[0-9]{2}/[0-9]{2}/[0-9]{4}$ ]]; then
-      evt_epoch=$(date -d "$f2 $f3" +%s 2>/dev/null || echo 0)
+    if (( SEL_DAYS>0 )) && [[ "$f2" =~ ^[0-9]{2}[-/][0-9]{2}[-/][0-9]{4}$ ]]; then
+      evt_epoch=$(date -d "$(normalize_mmddyyyy "$f2") $f3" +%s 2>/dev/null || echo 0)
       if (( evt_epoch>0 && evt_epoch<cutoff )); then
         continue
       fi
@@ -3679,7 +4141,7 @@ check_bmc() {
     SEL_TOP_ARRAY+=("{\"sensor\":\"$esc_name\",\"count\":$cnt}")
   done < <(for k in "${!SENSOR_SUMMARY[@]}"; do echo "${SENSOR_SUMMARY[$k]}:$k"; done | sort -rn | head -n "$SEL_SHOW")
 
-  echo "[SEL] CRIT=$SEL_CRIT WARN=$SEL_WARN INFO=$SEL_INFO (noise_hidden=$SEL_NOISE_HIDE noise_raw=$SEL_NOISE_RAW) (Top: $top_str)"
+  echo "[SEL] CRIT=$SEL_CRIT WARN=$SEL_WARN INFO=$SEL_INFO (noise_hidden=$SEL_NOISE_HIDE noise_raw=$SEL_NOISE_RAW) (Top: $top_str)" >&2
 
   {
     echo '['
@@ -3691,7 +4153,7 @@ check_bmc() {
       "$SEL_CRIT" "$SEL_WARN" "$SEL_INFO" "$SEL_NOISE_RAW" "$SEL_NOISE_HIDE"
     echo ']'
   } > "$SEL_EVENTS_JSON"
-  echo "[SEL] 事件明細 JSON: $SEL_EVENTS_JSON"
+  echo "[SEL] 事件明細 JSON: $SEL_EVENTS_JSON" >&2
 
   if [[ -n "$SEL_TOP_JSON" ]]; then
     {
@@ -3702,44 +4164,153 @@ check_bmc() {
       done
       echo ']'
     } > "$SEL_TOP_JSON"
-    echo "[SEL] Top sensors JSON: $SEL_TOP_JSON"
+    echo "[SEL] Top sensors JSON: $SEL_TOP_JSON" >&2
   fi
 
   local final_status="PASS"
-  local final_reason="SEL 無關鍵事件"
   if (( SEL_CRIT > 0 )); then
     final_status="FAIL"
-    final_reason="SEL CRIT=$SEL_CRIT WARN=$SEL_WARN"
   elif (( SEL_WARN > 0 )); then
     final_status="WARN"
-    final_reason="SEL WARN=$SEL_WARN"
   fi
 
-  local last_cw_date="" last_cw_ts="" _dt="" _mmdd="" days_since_last=""
+  local now_epoch last_cw_ts="" last_event_days="" days_since_display="N/A"
+  now_epoch=$SCRIPT_START_TS
+  local sel_regex
+  sel_regex=$(item_regex 12)
+  if [[ -n "$sel_regex" && -f "$SEL_DETAIL_FILE" ]]; then
+    last_cw_ts=$(last_event_epoch_in_sel "$SEL_DETAIL_FILE" "$now_epoch" "$SEL_DAYS" "$sel_regex")
+  fi
+  if [[ -n "$last_cw_ts" && "$last_cw_ts" != "0" ]]; then
+    local delta=$(( now_epoch - last_cw_ts ))
+    (( delta < 0 )) && delta=0
+    last_event_days=$(( (delta + 43200) / 86400 ))
+    days_since_display="$last_event_days"
+  elif (( SEL_DAYS > 0 )); then
+    days_since_display=">${SEL_DAYS}"
+  fi
 
-  # ---- [SEL] append "X 天前" 到 Reason ----
-  # 需要：SEL_EVENTS_JSON、SEL_DAYS、SCRIPT_START_TS、final_reason、SEL_CRIT、SEL_WARN
-  {
-    last_cw_date="$(jq -r 'map(select(.level=="CRIT" or .level=="WARN")) | last | .datetime // empty' "$SEL_EVENTS_JSON" 2>/dev/null)"
-  } || true
+  local days_clause_text=""
+  if [[ -n "$last_event_days" ]]; then
+    days_clause_text="距今天數約 ${last_event_days} 天前"
+  elif [[ "$days_since_display" =~ ^[0-9]+$ ]]; then
+    days_clause_text="距今天數約 ${days_since_display} 天前"
+  elif [[ "$days_since_display" == "N/A" ]]; then
+    days_clause_text="距今天數不明"
+  else
+    days_clause_text="距今天數約 ${days_since_display} 天前"
+  fi
 
-  if [[ -n "$last_cw_date" ]]; then
-    _dt="${last_cw_date/T/ }"
-    last_cw_ts="$(date -d "$_dt" +%s 2>/dev/null || true)"
-    if [[ -z "$last_cw_ts" ]]; then
-      _mmdd="$(sed -E 's#^([0-9]{2})-([0-9]{2})-([0-9]{4})#\3-\1-\2#' <<< "$_dt")"
-      last_cw_ts="$(date -d "$_mmdd" +%s 2>/dev/null || true)"
-    fi
-    if [[ -n "$last_cw_ts" ]]; then
-      days_since_last=$(( (SCRIPT_START_TS - last_cw_ts) / 86400 ))
-      if (( SEL_CRIT==0 && SEL_WARN==0 )); then
-        final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 ${days_since_last} 天未再發"
-      else
-        final_reason+=" (最近一次 CRIT/WARN 為 ${days_since_last} 天前)"
+  local recent_events_value="none"
+  local recent_ok_str="true"
+  if [[ -z "${__SEL_SUMMARY_DONE:-}" ]]; then __SEL_SUMMARY_DONE=1
+  local -a recent_events_lines=()
+  local last_event_type=""
+  local primary_event=""
+  local last_event_type=""
+  if [[ -s "$SEL_EVENTS_JSON" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      recent_events_lines+=("$line")
+    done < <(jq -r '
+      [ .[] | select(type=="object" and has("datetime")) ]
+      | sort_by(.datetime) | reverse | .[:3]
+      | map(
+          (.datetime // "")
+          + "|" + (.sensor // "")
+          + "|" + (.event // "")
+          + "|" + (.severity // "")
+        )
+      | .[]
+    ' "$SEL_EVENTS_JSON" 2>/dev/null || true)
+  fi
+
+  local recent_events_display=""
+  local -a recent_display_parts=()
+  local primary_event=""
+  if (( ${#recent_events_lines[@]} > 0 )); then
+    recent_ok_str="false"
+    local idx=0
+    for entry in "${recent_events_lines[@]}"; do
+      IFS='|' read -r dt sensor event severity <<< "$entry"
+      local dt_clean="${dt//T/ }"
+      dt_clean="${dt_clean%%.*}"
+      dt_clean=$(echo "$dt_clean" | xargs)
+      local sensor_clean=$(echo "${sensor:-<sensor>}" | xargs)
+      local event_clean=$(echo "${event:-<event>}" | xargs)
+      recent_display_parts+=("${dt_clean} ${sensor_clean} ${event_clean}")
+      if (( idx == 0 )); then
+        primary_event="${dt_clean} ${sensor_clean} ${event_clean}"
+        last_event_type=$(echo "${severity:-}" | tr '[:lower:]' '[:upper:]')
       fi
-    fi
+      ((idx++))
+    done
+    recent_events_display=$(IFS='；'; echo "${recent_display_parts[*]}")
+    recent_events_value=$(IFS='; '; echo "${recent_display_parts[*]}")
+    recent_events_value=$(echo "$recent_events_value" | xargs)
+    [[ -z "$recent_events_value" ]] && recent_events_value="none"
   fi
-  # -----------------------------------------
+
+  local recent_clause=""
+  if (( ${#recent_display_parts[@]} > 0 )); then
+    local extra_clause=""
+    if (( ${#recent_display_parts[@]} > 1 )); then
+      local -a extra_parts=("${recent_display_parts[@]:1}")
+      local extras_join
+      extras_join=$(IFS='；'; echo "${extra_parts[*]}")
+      extra_clause="；其他：${extras_join}"
+    fi
+    local event_type_label="${last_event_type:-事件}"
+    local days_label=""
+    if [[ -n "$last_event_days" ]]; then
+      days_label="$last_event_days"
+    elif [[ "$days_since_display" =~ ^[0-9]+$ ]]; then
+      days_label="$days_since_display"
+    else
+      days_label="未知"
+    fi
+    recent_clause="最近一次 ${event_type_label} 事件為 ${days_label} 天前：${primary_event}${extra_clause}"
+  fi
+
+  echo "[SEL] days_since_last=${days_since_display}" >&2
+  if [[ -n "$recent_events_display" ]]; then
+    echo "[SEL] recent_events=${recent_events_display}" >&2
+  fi
+
+  local final_reason=""
+  case "$final_status" in
+    PASS)
+      if [[ "$days_since_display" == "N/A" ]]; then
+        final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今未蒐集到最近 CRIT/WARN 訊息"
+      else
+        final_reason="過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 ${days_since_display} 天未再發"
+      fi
+      ;;
+    WARN)
+      local warn_days_label="${last_event_days:-未知}"
+      if [[ "$warn_days_label" == "未知" && "$days_since_display" =~ ^[0-9]+$ ]]; then
+        warn_days_label="$days_since_display"
+      fi
+      local warn_type_label="${last_event_type:-CRIT/WARN}"
+      [[ -z "$warn_type_label" ]] && warn_type_label="CRIT/WARN"
+      final_reason="SEL WARN=${SEL_WARN}（最近一次 ${warn_type_label} 為 ${warn_days_label} 天前）"
+      if [[ -n "$recent_clause" ]]; then
+        final_reason+="；${recent_clause}"
+      fi
+      ;;
+    FAIL)
+      local fail_days_label="${last_event_days:-未知}"
+      if [[ "$fail_days_label" == "未知" && "$days_since_display" =~ ^[0-9]+$ ]]; then
+        fail_days_label="$days_since_display"
+      fi
+      local fail_type_label="${last_event_type:-CRIT/WARN}"
+      [[ -z "$fail_type_label" ]] && fail_type_label="CRIT/WARN"
+      final_reason="SEL CRIT=${SEL_CRIT} WARN=${SEL_WARN}（最近一次 ${fail_type_label} 為 ${fail_days_label} 天前）"
+      if [[ -n "$recent_clause" ]]; then
+        final_reason+="；${recent_clause}"
+      fi
+      ;;
+  esac
 
   local final_json
   final_json=$(jq -n --arg item "$item" --arg status "$final_status" --arg reason "$final_reason" --argjson evidence "$evidence" \
@@ -3747,18 +4318,24 @@ check_bmc() {
 
   # --- Build judgement ---
   local th_json
-  th_json=$(jq -n --arg sel_days "$SEL_DAYS" '{SEL_DAYS: ($sel_days|tonumber)}')
+  th_json=$(jq -n \
+    --arg sel_days "$SEL_DAYS" \
+    --arg recover "$RECOVER_DAYS" \
+    '{SEL_DAYS: ($sel_days|tonumber), RECOVER_DAYS: ($recover|tonumber)}')
 
   local checks_json
   checks_json=$(jq -n \
     --arg crit "$SEL_CRIT" \
     --arg warn "$SEL_WARN" \
     --arg info "$SEL_INFO" \
-    --arg days_since "$days_since_last" \
+    --arg days_since "$days_since_display" \
+    --arg recent "$recent_events_value" \
+    --argjson recent_ok "$recent_ok_str" \
     '[{"name":"SEL CRIT 事件=0","ok":($crit|tonumber==0),"value":("crit="+$crit)},
       {"name":"SEL WARN 事件=0","ok":($warn|tonumber==0),"value":("warn="+$warn)},
       {"name":"SEL INFO 事件計數","ok":true,"value":("info="+$info)},
-      {"name":"距上次 CRIT/WARN 天數","ok":true,"value":("days_since_last="+$days_since)}]')
+      {"name":"距上次 CRIT/WARN 天數","ok":true,"value":("days_since_last="+$days_since)},
+      {"name":"recent SEL events","ok":$recent_ok,"value":$recent}]')
 
   local pass_rules='["SEL_DAYS 視窗內 CRIT=0 且 WARN=0"]'
   local warn_rules='["SEL WARN>0 但 CRIT=0"]'
@@ -3768,6 +4345,7 @@ check_bmc() {
   local jdg_json
   jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
 
+  fi
   set_check_result_with_jdg 12 "$final_json" "$jdg_json"
 }
 
@@ -3819,30 +4397,255 @@ check_logs() {
 
 # ----------------- 14 Firmware -----------------
 BIOS_VERSION=""
-check_firmware() {
-  echo -e "${C_BLUE}[14] 韌體版本${C_RESET}"
-  local bios
-  bios=$(sudo dmidecode -t bios 2>/dev/null | egrep -i 'Version|Release Date' || true)
-  echo "$bios"
-  BIOS_VERSION=$(echo "$bios" | grep -i 'Version' | head -n1 | awk -F: '{print $2}' | xargs || echo "")
+BIOS_VERSION_CHECK_VALUE=""
+FIRMWARE_ENUM_MESSAGE=""
+collect_firmware_info() {
+  local firmware_dir="$LOG_DIR/firmware"
+  mkdir -p "$firmware_dir"
+  local firmware_log="${firmware_dir}/firmware_${TIMESTAMP}.log"
+  local firmware_json="${firmware_dir}/firmware_${TIMESTAMP}.json"
+  : > "$firmware_log"
+
+  local -a bios_entries=()
+  local -a nic_entries=()
+  local -a gpu_entries=()
+  local -a disk_entries=()
+  local -a nvme_entries=()
+
+  # === BIOS ===
+  local bios_version=""
+  local bios_ok="false"
+  local bios_reason=""
+
+  if ! command -v dmidecode >/dev/null 2>&1; then
+    bios_reason="dmidecode not available"
+    echo "== dmidecode -t bios (not available) ==" >> "$firmware_log"
+    echo "$bios_reason" >> "$firmware_log"
+  else
+    local dm_raw dm_rc
+    dm_raw=$(dmidecode -t bios 2>&1)
+    dm_rc=$?
+    {
+      echo "== dmidecode -t bios (non-root) =="
+      printf '%s\n' "$dm_raw"
+    } >> "$firmware_log"
+
+    if (( dm_rc == 0 )); then
+      bios_version=$(printf '%s\n' "$dm_raw" | awk -F: '/^[[:space:]]*BIOS Version/ {print $2; exit}' | xargs)
+      [[ -z "$bios_version" ]] && bios_version=$(printf '%s\n' "$dm_raw" | awk -F: '/^[[:space:]]*Version/ {print $2; exit}' | xargs)
+      [[ -n "$bios_version" ]] && bios_ok="true" || bios_reason="unable to parse BIOS version"
+    else
+      if command -v sudo >/dev/null 2>&1; then
+        local sudo_raw sudo_rc
+        sudo_raw=$(sudo -n dmidecode -t bios 2>&1)
+        sudo_rc=$?
+        {
+          echo "== sudo -n dmidecode -t bios =="
+          printf '%s\n' "$sudo_raw"
+        } >> "$firmware_log"
+
+        if (( sudo_rc == 0 )); then
+          bios_version=$(printf '%s\n' "$sudo_raw" | awk -F: '/^[[:space:]]*BIOS Version/ {print $2; exit}' | xargs)
+          [[ -z "$bios_version" ]] && bios_version=$(printf '%s\n' "$sudo_raw" | awk -F: '/^[[:space:]]*Version/ {print $2; exit}' | xargs)
+          [[ -n "$bios_version" ]] && bios_ok="true" || bios_reason="unable to parse BIOS version"
+        else
+          grep -qi 'password' <<< "$sudo_raw" && bios_reason="permission denied (sudo password required)" || bios_reason="dmidecode failed (rc=$sudo_rc)"
+        fi
+      else
+        grep -qi 'permission denied' <<< "$dm_raw" && bios_reason="permission denied (root required)" || bios_reason="dmidecode failed (rc=$dm_rc)"
+      fi
+    fi
+  fi
+
+  bios_entries+=("$(jq -n --arg ver "$bios_version" --arg ok "$bios_ok" --arg reason "$bios_reason" \
+    '{version:$ver, ok:($ok=="true"), reason:(if $reason=="" then null else $reason end)}')")
+
+  # === BMC ===
   if (( ! SKIP_BMC )); then
-    ipmi_try mc info 2>/dev/null | egrep -i 'Firmware|Version' || true
+    echo "== ipmitool mc info ==" >> "$firmware_log"
+    local bmc_fw
+    bmc_fw=$(ipmi_try mc info 2>/dev/null | egrep -i 'Firmware' | tee -a "$firmware_log" || echo "")
   fi
-  for nic in $(ls /sys/class/net | grep -v lo); do
-    echo "NIC $nic:"
-    ethtool -i "$nic" 2>/dev/null | egrep -i 'driver|firmware|version' || true
+
+  # === NICs ===
+  for nic in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
+    echo "== NIC $nic ==" >> "$firmware_log"
+    local nic_info
+    nic_info=$(ethtool -i "$nic" 2>/dev/null | egrep -i 'driver|firmware|version' | tee -a "$firmware_log" || true)
+    local nic_driver nic_fw
+    nic_driver=$(echo "$nic_info" | awk -F: '/^driver:/ {print $2}' | xargs)
+    nic_fw=$(echo "$nic_info" | awk -F: '/^firmware-version:/ {print $2}' | xargs)
+    nic_entries+=("$(jq -n --arg name "$nic" --arg driver "$nic_driver" --arg fw "$nic_fw" \
+      '{name:$name, driver:$driver, firmware:$fw}')")
   done
+
+  # === GPU (NVIDIA) ===
   if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=driver_version,firmware_version --format=csv 2>/dev/null || true
+    echo "== nvidia-smi --query-gpu ==" >> "$firmware_log"
+    local gpu_info
+    gpu_info=$(nvidia-smi --query-gpu=driver_version,vbios_version --format=csv,noheader 2>/dev/null | tee -a "$firmware_log" || true)
+    while IFS=',' read -r driver_ver vbios_ver; do
+      driver_ver=$(echo "$driver_ver" | xargs)
+      vbios_ver=$(echo "$vbios_ver" | xargs)
+      gpu_entries+=("$(jq -n --arg driver "$driver_ver" --arg vbios "$vbios_ver" \
+        '{driver_version:$driver, vbios_version:$vbios}')")
+    done <<< "$gpu_info"
   fi
+
+  # === Disks (SMART) ===
   for d in /dev/sd?; do
     [[ -b "$d" ]] || continue
-    smartctl -i "$d" 2>/dev/null | egrep -i 'Device Model|Model Number|Firmware|Serial' || true
+    echo "== smartctl -i $d ==" >> "$firmware_log"
+    local disk_info
+    disk_info=$(smartctl -i "$d" 2>/dev/null | egrep -i 'Device Model|Model Number|Firmware|Serial' | tee -a "$firmware_log" || true)
+    local disk_model disk_fw disk_serial
+    disk_model=$(echo "$disk_info" | awk -F: '/Device Model|Model Number:/ {print $2; exit}' | xargs)
+    disk_fw=$(echo "$disk_info" | awk -F: '/Firmware Version:/ {print $2; exit}' | xargs)
+    disk_serial=$(echo "$disk_info" | awk -F: '/Serial Number:/ {print $2; exit}' | xargs)
+    disk_entries+=("$(jq -n --arg dev "$d" --arg model "$disk_model" --arg fw "$disk_fw" --arg serial "$disk_serial" \
+      '{device:$dev, model:$model, firmware:$fw, serial:$serial}')")
   done
+
+  # === NVMe ===
   if command -v nvme >/dev/null 2>&1; then
-    nvme list 2>/dev/null || true
+    echo "== nvme list ==" >> "$firmware_log"
+    local nvme_list_json
+    nvme_list_json=$(nvme list -o json 2>/dev/null | tee -a "$firmware_log" || echo '{}')
+    if [[ -n "$nvme_list_json" && "$nvme_list_json" != "{}" ]]; then
+      local -a nvme_devices
+      mapfile -t nvme_devices < <(echo "$nvme_list_json" | jq -r '.Devices[]? | "\(.DevicePath)|\(.ModelNumber // "")|\(.Firmware // "")|\(.SerialNumber // "")"' 2>/dev/null || true)
+      for nv in "${nvme_devices[@]}"; do
+        IFS='|' read -r dev model fw serial <<< "$nv"
+        nvme_entries+=("$(jq -n --arg dev "$dev" --arg model "$model" --arg fw "$fw" --arg serial "$serial" \
+          '{device:$dev, model:$model, firmware:$fw, serial:$serial}')")
+      done
+    fi
   fi
-  set_status 14 "INFO" "列出 BIOS/NIC/GPU/Disk/NVMe (人工比對)"
+
+  # === Build JSON ===
+  local bios_json='[]'
+  (( ${#bios_entries[@]} > 0 )) && bios_json=$(printf '%s\n' "${bios_entries[@]}" | jq -s '.')
+  local nic_json='[]'
+  (( ${#nic_entries[@]} > 0 )) && nic_json=$(printf '%s\n' "${nic_entries[@]}" | jq -s '.')
+  local gpu_json='[]'
+  (( ${#gpu_entries[@]} > 0 )) && gpu_json=$(printf '%s\n' "${gpu_entries[@]}" | jq -s '.')
+  local disk_json='[]'
+  (( ${#disk_entries[@]} > 0 )) && disk_json=$(printf '%s\n' "${disk_entries[@]}" | jq -s '.')
+  local nvme_json='[]'
+  (( ${#nvme_entries[@]} > 0 )) && nvme_json=$(printf '%s\n' "${nvme_entries[@]}" | jq -s '.')
+
+  local fw_full_json
+  fw_full_json=$(jq -n \
+    --argjson bios "$bios_json" \
+    --argjson nic "$nic_json" \
+    --argjson gpu "$gpu_json" \
+    --argjson disk "$disk_json" \
+    --argjson nvme "$nvme_json" \
+    '{bios:$bios, nic:$nic, gpu:$gpu, disk:$disk, nvme:$nvme}')
+
+  printf '%s\n' "$fw_full_json" > "$firmware_json"
+
+  # Export for check_firmware to use
+  export FW_BIOS_VERSION="$bios_version"
+  export FW_BIOS_OK="$bios_ok"
+  export FW_BIOS_REASON="$bios_reason"
+  export FW_LOG="$firmware_log"
+  export FW_JSON="$firmware_json"
+  export FW_FULL_JSON="$fw_full_json"
+}
+
+check_firmware() {
+  echo -e "${C_BLUE}[14] 韌體版本${C_RESET}"
+
+  # Call the collection function
+  collect_firmware_info
+
+  # Print summary to console
+  cat "$FW_LOG"
+
+  BIOS_VERSION="$FW_BIOS_VERSION"
+  BIOS_VERSION_CHECK_VALUE="$FW_BIOS_REASON"
+  [[ "$FW_BIOS_OK" == "true" ]] && BIOS_VERSION_CHECK_VALUE="$FW_BIOS_VERSION"
+  FIRMWARE_ENUM_MESSAGE="captured in ${FW_LOG##*/}; JSON=${FW_JSON##*/}"
+  export BIOS_VERSION
+  export BIOS_VERSION_CHECK_VALUE
+
+  # Build reason
+  local firmware_reason="列出 BIOS/NIC/GPU/Disk/NVMe 版本資訊"
+  if [[ "$FW_BIOS_OK" == "true" ]]; then
+    firmware_reason="BIOS: ${FW_BIOS_VERSION}; 其他版本詳見 logs/firmware/*.json"
+  else
+    firmware_reason="BIOS: ${FW_BIOS_REASON}; 其他版本詳見 logs/firmware/*.json"
+  fi
+
+  # Build checks from firmware JSON
+  local -a checks_entries=()
+
+  # BIOS check
+  local bios_value="$FW_BIOS_VERSION"
+  [[ -z "$bios_value" ]] && bios_value="$FW_BIOS_REASON"
+  checks_entries+=("$(jq -n --arg ok "$FW_BIOS_OK" --arg val "$bios_value" \
+    '{name:"BIOS version", ok:($ok=="true"), value:$val}')")
+
+  # NIC checks
+  local nic_count=$(echo "$FW_FULL_JSON" | jq -r '.nic | length')
+  if (( nic_count > 0 )); then
+    local nic_summary
+    nic_summary=$(echo "$FW_FULL_JSON" | jq -r '.nic | map("\(.name):\(.driver)") | join(", ")')
+    checks_entries+=("$(jq -n --arg val "$nic_summary" \
+      '{name:"NIC drivers", ok:true, value:$val}')")
+  fi
+
+  # GPU checks
+  local gpu_count=$(echo "$FW_FULL_JSON" | jq -r '.gpu | length')
+  if (( gpu_count > 0 )); then
+    local gpu_summary
+    gpu_summary=$(echo "$FW_FULL_JSON" | jq -r '.gpu | map("driver:\(.driver_version)") | join(", ")')
+    checks_entries+=("$(jq -n --arg val "$gpu_summary" \
+      '{name:"GPU drivers", ok:true, value:$val}')")
+  fi
+
+  # Disk checks
+  local disk_count=$(echo "$FW_FULL_JSON" | jq -r '.disk | length')
+  if (( disk_count > 0 )); then
+    checks_entries+=("$(jq -n --arg val "$disk_count disks enumerated" \
+      '{name:"SATA/SAS disks", ok:true, value:$val}')")
+  fi
+
+  # NVMe checks
+  local nvme_count=$(echo "$FW_FULL_JSON" | jq -r '.nvme | length')
+  if (( nvme_count > 0 )); then
+    checks_entries+=("$(jq -n --arg val "$nvme_count devices enumerated" \
+      '{name:"NVMe devices", ok:true, value:$val}')")
+  fi
+
+  local checks_json='[]'
+  if (( ${#checks_entries[@]} > 0 )); then
+    checks_json=$(printf '%s\n' "${checks_entries[@]}" | jq -s '.')
+  fi
+
+  local evidence_json
+  evidence_json=$(jq -n --arg log "$FW_LOG" --arg json "$FW_JSON" \
+    '{firmware_log:$log, firmware_json:$json}')
+
+  local pass_rules='["成功列舉 BIOS/NIC/GPU/Disk/NVMe 版本"]'
+  local warn_rules='["部分項目無法取得"]'
+  local fail_rules='["N/A（INFO 級別檢查項）"]'
+  local criteria="韌體版本收集：列舉系統各元件韌體與驅動版本，供人工比對與記錄用途。"
+
+  local base_json
+  base_json=$(jq -n \
+    --arg status "INFO" \
+    --arg item "Firmware.Version" \
+    --arg reason "$firmware_reason" \
+    --argjson metrics "$FW_FULL_JSON" \
+    --argjson evidence "$evidence_json" \
+    '{status:$status, item:$item, reason:$reason, metrics:$metrics, evidence:$evidence}')
+
+  local jdg_json
+  jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" '{}')
+
+  set_check_result_with_jdg 14 "$base_json" "$jdg_json"
 }
 
 # ----------------- 15 Fio -----------------
@@ -4089,6 +4892,7 @@ consolidate_report() {
         local criteria=$(echo "$judgement_json" | jq -r '.criteria // ""')
         if [[ -n "$criteria" && "$criteria" != "null" ]]; then
             echo -e "       ${C_BOLD}Criteria:${C_RESET} $criteria"
+            # Quick verify: grep -n 'Criteria:' logs/*_health_*.md | head
         fi
 
         # 顯示 checks 摘要（只顯示失敗的或關鍵的）
