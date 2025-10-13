@@ -1675,7 +1675,7 @@ check_disks() {
         fi
         if [[ -n "$raid_summary_raw" && "$raid_summary_raw" != "{}" ]]; then
             raid_controllers_json=$(echo "$raid_summary_raw" | jq -c '
-                try (.controllers // []) | map({
+                ((.controllers // []) | map({
                     id: ("c" + (.controller|tostring)),
                     model: (.model // ""),
                     virtual_drives: {
@@ -1693,7 +1693,7 @@ check_disks() {
                         foreign: 0,
                         pred_fail: (.pd.predictive // 0)
                     }
-                }) catch []')
+                })) // []')
             if [[ -n "$raid_controllers_json" && "$raid_controllers_json" != "[]" ]]; then
                 storcli_scanned=1
                 raid_driver="storcli"
@@ -1847,18 +1847,18 @@ check_disks() {
             if [[ -n "$dev_type" && "$dev_type" != "auto" ]]; then
                 smart_cmd+=(-d "$dev_type")
             fi
-        smart_cmd+=(-i -H -A -j "$disk")
-        local smart_json
-        smart_json=$("${smart_cmd[@]}" 2>/dev/null)
-        local rc=$?
-        if [[ -z "$smart_json" ]]; then
-            smart_reason="${smart_reason:-command_failed}"
-            smartctl_state="error"
-            continue
-        fi
-        if (( rc != 0 )) && [[ -z "$smart_reason" ]]; then
-            smart_reason="command_exit_${rc}"
-        fi
+            smart_cmd+=(-i -H -A -j "$disk")
+            local smart_json
+            smart_json=$("${smart_cmd[@]}" 2>/dev/null)
+            local rc=$?
+            if [[ -z "$smart_json" ]]; then
+                smart_reason="${smart_reason:-command_failed}"
+                smartctl_state="error"
+                continue
+            fi
+            if (( rc != 0 )) && [[ -z "$smart_reason" ]]; then
+                smart_reason="command_exit_${rc}"
+            fi
             local model
             model=$(echo "$smart_json" | jq -r '.model_name // .device.model_name // .device.model_number // .model_family // "unknown"' 2>/dev/null)
             local smart_pass
@@ -1898,6 +1898,9 @@ check_disks() {
             if [[ "$poh" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
                 poh_json="$poh"
             fi
+            [[ "$reallocated" =~ ^-?[0-9]+$ ]] || reallocated=0
+            [[ "$pending" =~ ^-?[0-9]+$ ]] || pending=0
+            [[ "$uncorrect" =~ ^-?[0-9]+$ ]] || uncorrect=0
             smart_devices_entries+=("$(jq -n \
                 --arg dev "$disk" \
                 --arg model "$model" \
@@ -2065,6 +2068,16 @@ check_disks() {
         nvme_pct80_json=$(printf '%s\n' "${nvme_pct80_list[@]}" | jq -R . | jq -s '.')
     fi
 
+    : "${smart_devices_json:=[]}"
+    : "${smart_failed_json:=[]}"
+    : "${smart_realloc_json:=[]}"
+    : "${smart_pending_json:=[]}"
+    : "${smart_uncorr_json:=[]}"
+    : "${nvme_devices_json:=[]}"
+    : "${nvme_cw_json:=[]}"
+    : "${nvme_media_err_json:=[]}"
+    : "${nvme_pct80_json:=[]}"
+
     local smart_failed_count=${#smart_failed_list[@]}
     local smart_realloc_count=${#smart_realloc_list[@]}
     local smart_pending_count=${#smart_pending_list[@]}
@@ -2081,6 +2094,7 @@ check_disks() {
       --argjson pending "$smart_pending_json" \
       --argjson uncorr "$smart_uncorr_json" \
       '{failed:$failed, realloc_gt0:$realloc, pending_gt0:$pending, uncorrect_gt0:$uncorr}')
+    : "${smart_alerts_json:={}}"
     local smart_scan_file_json
     smart_scan_file_json=$(jq -n \
       --argjson devices "$smart_devices_json" \
@@ -2094,6 +2108,7 @@ check_disks() {
       --argjson media "$nvme_media_err_json" \
       --argjson pct "$nvme_pct80_json" \
       '{crit_warn_gt0:$crit, media_err_gt0:$media, pct_used_ge80:$pct}')
+    : "${nvme_alerts_json:={}}"
     local nvme_scan_file_json
     nvme_scan_file_json=$(jq -n \
       --argjson devices "$nvme_devices_json" \
@@ -2111,16 +2126,24 @@ check_disks() {
         tips_text+=$'\n如需檢查硬體 RAID，請安裝 storcli (MegaRAID 工具)'
     fi
 
+    : "${raid_controllers_json:=[]}"
+    : "${mdadm_arrays_json:=[]}"
     local raid_metrics_json
     raid_metrics_json=$(jq -n --arg driver "$raid_driver" --argjson controllers "$raid_controllers_json" --argjson arrays "$mdadm_arrays_json" '{driver:$driver, controllers:$controllers, mdadm:{arrays:$arrays}}')
     local smart_scanned_json=$([[ $smart_scanned -eq 1 ]] && echo true || echo false)
     local nvme_scanned_json=$([[ $nvme_scanned -eq 1 ]] && echo true || echo false)
+    : "${smart_scanned_json:=false}"
+    : "${nvme_scanned_json:=false}"
     local smart_metrics_json
     smart_metrics_json=$(jq -n --argjson scanned $smart_scanned_json --argjson devices "$smart_devices_json" --argjson failed "$smart_failed_json" --argjson realloc "$smart_realloc_json" --argjson pending "$smart_pending_json" --argjson uncorr "$smart_uncorr_json" '{scanned:$scanned, devices:$devices, alerts:{failed:$failed, realloc_gt0:$realloc, pending_gt0:$pending, uncorr_gt0:$uncorr}}')
     local nvme_metrics_json
     nvme_metrics_json=$(jq -n --argjson scanned $nvme_scanned_json --argjson devices "$nvme_devices_json" --argjson cw "$nvme_cw_json" --argjson media "$nvme_media_err_json" --argjson pct "$nvme_pct80_json" '{scanned:$scanned, devices:$devices, alerts:{crit_warn_gt0:$cw, media_err_gt0:$media, pct_used_ge80:$pct}}')
+    : "${raid_metrics_json:={}}"
+    : "${smart_metrics_json:={}}"
+    : "${nvme_metrics_json:={}}"
     local metrics_json
     metrics_json=$(jq -n --argjson raid "$raid_metrics_json" --argjson smart "$smart_metrics_json" --argjson nvme "$nvme_metrics_json" '{raid:$raid, smart:$smart, nvme:$nvme}')
+    : "${metrics_json:={}}"
 
     local tools_json
     tools_json=$(jq -n \
@@ -2361,6 +2384,40 @@ check_disks() {
     local summary_text
     summary_text=$(IFS='; '; echo "${summary_parts[*]}")
 
+    local smart_ok_count=$(( smart_device_count - smart_failed_count ))
+    (( smart_ok_count < 0 )) && smart_ok_count=0
+    local nvme_alert_total=$(( nvme_cw_count + nvme_media_err_count + nvme_pct80_count ))
+    local nvme_ok_count=$(( nvme_device_count - nvme_alert_total ))
+    (( nvme_ok_count < 0 )) && nvme_ok_count=0
+    local -a raid_issue_parts=()
+    local raid_has_data=0
+    (( raid_controller_count > 0 )) && raid_has_data=1
+    (( mdadm_arrays_found > 0 )) && raid_has_data=1
+    (( vd_degraded > 0 )) && raid_issue_parts+=("vd_degraded=${vd_degraded}")
+    (( vd_failed > 0 )) && raid_issue_parts+=("vd_failed=${vd_failed}")
+    (( vd_rebuild > 0 )) && raid_issue_parts+=("vd_rebuild=${vd_rebuild}")
+    (( pd_failed > 0 )) && raid_issue_parts+=("pd_failed=${pd_failed}")
+    (( pd_missing > 0 )) && raid_issue_parts+=("pd_missing=${pd_missing}")
+    (( mdadm_degraded > 0 )) && raid_issue_parts+=("mdadm_degraded=${mdadm_degraded}")
+    (( mdadm_recovering > 0 )) && raid_issue_parts+=("mdadm_recovering=${mdadm_recovering}")
+    local raid_status_summary=""
+    if (( raid_has_data )); then
+        if (( ${#raid_issue_parts[@]} == 0 )); then
+            raid_status_summary="Optimal"
+        else
+            raid_status_summary=$(IFS=', '; echo "${raid_issue_parts[*]}")
+        fi
+    else
+        if (( storcli_scanned == 0 )) && [[ -n "$storcli_reason" ]]; then
+            raid_status_summary="Skipped(${storcli_reason})"
+        else
+            raid_status_summary="None"
+        fi
+    fi
+    local disk_health_summary=$(printf "RAID: %s; SMART: ok=%s/%s fail=%s; NVMe: ok=%s/%s media_err=%s crit_warn=%s pct80=%s" \
+        "$raid_status_summary" "$smart_ok_count" "$smart_device_count" "$smart_failed_count" \
+        "$nvme_ok_count" "$nvme_device_count" "$nvme_media_err_count" "$nvme_cw_count" "$nvme_pct80_count")
+
     local smart_alert_total=$((smart_failed_count + smart_realloc_count + smart_pending_count + smart_uncorr_count))
     local reason_core
     reason_core=$(printf "ctl=%s vd_total/dgrd/fail=%s/%s/%s pd_total/fail/missing=%s/%s/%s smart_alerts=%s nvme_media_err=%s" \
@@ -2371,6 +2428,13 @@ check_disks() {
     fi
     if [[ "$final_status" != "PASS" && -n "$highlight_text" ]]; then
         final_reason+="；異常：$highlight_text"
+    fi
+    if [[ -n "$disk_health_summary" ]]; then
+        if [[ -n "$final_reason" ]]; then
+            final_reason+="；${disk_health_summary}"
+        else
+            final_reason="$disk_health_summary"
+        fi
     fi
     if (( ${#missing_tools[@]} > 0 )); then
         declare -A _SEEN_MISSING=()
@@ -2383,9 +2447,14 @@ check_disks() {
             fi
         done
         if (( ${#unique_missing[@]} > 0 )); then
-            local missing_join
-            missing_join=$(IFS=','; echo "${unique_missing[*]}")
-            final_reason+="；缺少工具:${missing_join}"
+            local missing_join=""
+            local idx=0
+            for tool_name in "${unique_missing[@]}"; do
+                (( idx > 0 )) && missing_join+=", "
+                missing_join+="$tool_name"
+                ((idx++))
+            done
+            final_reason+="；缺少工具: ${missing_join}"
         fi
     fi
 
@@ -2406,6 +2475,7 @@ check_disks() {
     checks_entries+=("$(jq -n --arg nvme_cw "$nvme_cw_count" '{name:"NVMe crit_warn=0", ok:(($nvme_cw|tonumber)==0), value:("crit_warn="+$nvme_cw)}')")
     checks_entries+=("$(jq -n --arg nvme_media "$nvme_media_err_count" '{name:"NVMe media_err=0", ok:(($nvme_media|tonumber)==0), value:("media_err="+$nvme_media)}')")
     checks_entries+=("$(jq -n --arg nvme_pct "$nvme_pct80_count" '{name:"NVMe pct_used<80", ok:(($nvme_pct|tonumber)==0), value:("pct_used>=80_count="+$nvme_pct)}')")
+    checks_entries+=("$(jq -n --arg summary "$disk_health_summary" '{name:"Disk health summary", ok:true, value:$summary}')")
     local checks_json='[]'
     if (( ${#checks_entries[@]} > 0 )); then
         checks_json=$(printf '%s\n' "${checks_entries[@]}" | jq -s '.')
@@ -3525,6 +3595,74 @@ check_fans() {
         final_reason+=". Details: $(IFS=', '; echo "${fan_summary_array[*]}")"
     fi
 
+    local fan_zone_summary=""
+    local -a _fan_zone_lines=()
+    if [[ -f "$raw_ipmi_sdr_log" ]]; then
+        mapfile -t _fan_zone_lines < <(grep -E 'Fan[ _]?Zone[[:space:]_]*[0-9]+' "$raw_ipmi_sdr_log" 2>/dev/null || true)
+    elif [[ -n "$ipmi_sdr_out" ]]; then
+        mapfile -t _fan_zone_lines < <(printf '%s\n' "$ipmi_sdr_out" | grep -E 'Fan[ _]?Zone[[:space:]_]*[0-9]+' || true)
+    else
+        _fan_zone_lines=()
+    fi
+    if (( ${#_fan_zone_lines[@]} > 0 )); then
+        declare -A _seen_fan_zones=()
+        local -a _fan_zone_parts=()
+        for _zone_line in "${_fan_zone_lines[@]}"; do
+            if [[ $_zone_line =~ Fan[[:space:]_]*Zone[[:space:]_]*([0-9]+).*?([0-9]+)[[:space:]]*percent ]]; then
+                local _zone_id="${BASH_REMATCH[1]}"
+                local _zone_pct="${BASH_REMATCH[2]}"
+                local _zone_label="Z${_zone_id}"
+                if [[ -z "${_seen_fan_zones["$_zone_label"]:-}" ]]; then
+                    _seen_fan_zones["$_zone_label"]=1
+                    _fan_zone_parts+=("${_zone_label}=${_zone_pct}%")
+                fi
+            fi
+        done
+        if (( ${#_fan_zone_parts[@]} > 0 )); then
+            local _zone_join
+            _zone_join=$(IFS=', '; echo "${_fan_zone_parts[*]}")
+            fan_zone_summary="Zones: ${_zone_join}"
+        fi
+    fi
+
+    local worst_dev_summary=""
+    if [[ -f "$fan_eval_file" ]]; then
+        local _worst_dev_val
+        _worst_dev_val=$(jq -r '
+            (.metrics // [])
+            | map((.deviation_pct // empty) | (try tonumber catch empty))
+            | map(select(. != null))
+            | map(if . < 0 then (-.) else . end)
+            | max? // empty
+        ' "$fan_eval_file" 2>/dev/null || true)
+        if [[ -n "${_worst_dev_val:-}" && "${_worst_dev_val}" != "null" ]]; then
+            if [[ "$_worst_dev_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                local _worst_dev_int
+                _worst_dev_int=$(printf '%.0f' "$_worst_dev_val")
+                worst_dev_summary="worst dev=${_worst_dev_int}%"
+            fi
+        fi
+    fi
+
+    local fan_reason_suffix=""
+    if [[ -n "$fan_zone_summary" ]]; then
+        fan_reason_suffix="$fan_zone_summary"
+    fi
+    if [[ -n "$worst_dev_summary" ]]; then
+        if [[ -n "$fan_reason_suffix" ]]; then
+            fan_reason_suffix+="; ${worst_dev_summary}"
+        else
+            fan_reason_suffix="$worst_dev_summary"
+        fi
+    fi
+    if [[ -n "$fan_reason_suffix" ]]; then
+        if [[ -n "$final_reason" ]]; then
+            final_reason+="；${fan_reason_suffix}"
+        else
+            final_reason="$fan_reason_suffix"
+        fi
+    fi
+
     if [[ -n "$worst_fan" && -n "$worst_deviation_signed" ]]; then
         local worst_dev_fmt
         worst_dev_fmt=$(awk -v v="$worst_deviation_signed" 'BEGIN{printf "%+.1f%%", v+0}')
@@ -4203,73 +4341,176 @@ check_bmc() {
 
   local recent_events_value="none"
   local recent_ok_str="true"
-  if [[ -z "${__SEL_SUMMARY_DONE:-}" ]]; then __SEL_SUMMARY_DONE=1
-  local -a recent_events_lines=()
-  local last_event_type=""
-  local primary_event=""
-  local last_event_type=""
-  if [[ -s "$SEL_EVENTS_JSON" ]]; then
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      recent_events_lines+=("$line")
-    done < <(jq -r '
-      [ .[] | select(type=="object" and has("datetime")) ]
-      | sort_by(.datetime) | reverse | .[:3]
-      | map(
-          (.datetime // "")
-          + "|" + (.sensor // "")
-          + "|" + (.event // "")
-          + "|" + (.severity // "")
-        )
-      | .[]
-    ' "$SEL_EVENTS_JSON" 2>/dev/null || true)
-  fi
-
   local recent_events_display=""
-  local -a recent_display_parts=()
-  local primary_event=""
-  if (( ${#recent_events_lines[@]} > 0 )); then
-    recent_ok_str="false"
-    local idx=0
-    for entry in "${recent_events_lines[@]}"; do
-      IFS='|' read -r dt sensor event severity <<< "$entry"
-      local dt_clean="${dt//T/ }"
-      dt_clean="${dt_clean%%.*}"
-      dt_clean=$(echo "$dt_clean" | xargs)
-      local sensor_clean=$(echo "${sensor:-<sensor>}" | xargs)
-      local event_clean=$(echo "${event:-<event>}" | xargs)
-      recent_display_parts+=("${dt_clean} ${sensor_clean} ${event_clean}")
-      if (( idx == 0 )); then
-        primary_event="${dt_clean} ${sensor_clean} ${event_clean}"
-        last_event_type=$(echo "${severity:-}" | tr '[:lower:]' '[:upper:]')
-      fi
-      ((idx++))
-    done
-    recent_events_display=$(IFS='；'; echo "${recent_display_parts[*]}")
-    recent_events_value=$(IFS='; '; echo "${recent_display_parts[*]}")
-    recent_events_value=$(echo "$recent_events_value" | xargs)
-    [[ -z "$recent_events_value" ]] && recent_events_value="none"
-  fi
-
   local recent_clause=""
-  if (( ${#recent_display_parts[@]} > 0 )); then
-    local extra_clause=""
-    if (( ${#recent_display_parts[@]} > 1 )); then
-      local -a extra_parts=("${recent_display_parts[@]:1}")
-      local extras_join
-      extras_join=$(IFS='；'; echo "${extra_parts[*]}")
-      extra_clause="；其他：${extras_join}"
+  local primary_event=""
+  local last_event_type=""
+  if [[ -z "${__SEL_SUMMARY_DONE:-}" ]]; then
+    __SEL_SUMMARY_DONE=1
+    local -a recent_events_lines=()
+    if [[ -s "$SEL_EVENTS_JSON" ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        recent_events_lines+=("$line")
+      done < <(jq -r '
+        [ .[] 
+          | select(type=="object" and (.datetime|type=="string")) 
+          | {
+              datetime: (.datetime // ""),
+              sensor: (.sensor // ""),
+              event: (.event // ""),
+              severity: (.severity // "")
+            }
+        ]
+        | unique_by(.datetime + "|" + .sensor + "|" + .event + "|" + .severity)
+        | sort_by(.datetime) | reverse | .[:3]
+        | map(
+            (.datetime // "")
+            + "|" + (.sensor // "")
+            + "|" + (.event // "")
+            + "|" + (.severity // "")
+          )
+        | .[]
+      ' "$SEL_EVENTS_JSON" 2>/dev/null || true)
     fi
-    local event_type_label="${last_event_type:-事件}"
-    local days_label=""
-    if [[ -n "$last_event_days" ]]; then
-      days_label="$last_event_days"
-    elif [[ "$days_since_display" =~ ^[0-9]+$ ]]; then
-      days_label="$days_since_display"
-    else
-      days_label="未知"
+
+    if (( ${#recent_events_lines[@]} > 0 )); then
+      recent_ok_str="false"
+      local -a recent_display_parts=()
+      local -a parsed_events=()
+      local sep=$'\x1E'
+      for entry in "${recent_events_lines[@]}"; do
+        IFS='|' read -r dt sensor event severity <<< "$entry"
+        local dt_clean="${dt//T/ }"
+        dt_clean="${dt_clean%%.*}"
+        dt_clean=$(echo "$dt_clean" | xargs)
+        dt_clean=$(printf '%s' "$dt_clean" | LC_ALL=C tr -d '\r\000-\037\177')
+        dt_clean=${dt_clean//$'\xef\xbf\xbd'/}
+        local sensor_clean="${sensor:-<sensor>}"
+        sensor_clean=$(echo "$sensor_clean" | xargs)
+        sensor_clean=$(printf '%s' "$sensor_clean" | LC_ALL=C tr -d '\r\000-\037\177')
+        sensor_clean=${sensor_clean//$'\xef\xbf\xbd'/}
+        local event_clean="${event:-<event>}"
+        event_clean=$(echo "$event_clean" | xargs)
+        event_clean=$(printf '%s' "$event_clean" | LC_ALL=C tr -d '\r\000-\037\177')
+        event_clean=${event_clean//$'\xef\xbf\xbd'/}
+        local severity_upper
+        severity_upper=$(echo "${severity:-}" | tr '[:lower:]' '[:upper:]')
+        case "$severity_upper" in
+          CRITICAL|CRIT|EMERGENCY|ALERT) severity_upper="CRIT";;
+          WARNING|WARN) severity_upper="WARN";;
+          INFO|INFORMATIONAL|INFORMATION) severity_upper="INFO";;
+          *) severity_upper="INFO";;
+        esac
+        local display_entry="${dt_clean} ${sensor_clean} ${event_clean}"
+        display_entry=$(printf '%s' "$display_entry" | LC_ALL=C tr -d '\r\000-\037\177')
+        display_entry=${display_entry//$'\xef\xbf\xbd'/}
+        local event_epoch=""
+        local dt_normalized="$dt"
+        local dt_clean_normalized="$dt_clean"
+        if [[ "$dt_normalized" =~ ^([0-9]{2})([-/])([0-9]{2})\2([0-9]{4})(.*)$ ]]; then
+          local mm="${BASH_REMATCH[1]}"
+          local dd="${BASH_REMATCH[3]}"
+          local yyyy="${BASH_REMATCH[4]}"
+          local rest="${BASH_REMATCH[5]}"
+          dt_normalized="$(normalize_mmddyyyy "${mm}/${dd}/${yyyy}")${rest}"
+        fi
+        if [[ "$dt_clean_normalized" =~ ^([0-9]{2})([-/])([0-9]{2})\2([0-9]{4})(.*)$ ]]; then
+          local mm_c="${BASH_REMATCH[1]}"
+          local dd_c="${BASH_REMATCH[3]}"
+          local yyyy_c="${BASH_REMATCH[4]}"
+          local rest_c="${BASH_REMATCH[5]}"
+          dt_clean_normalized="$(normalize_mmddyyyy "${mm_c}/${dd_c}/${yyyy_c}")${rest_c}"
+        fi
+        if [[ -n "$dt_normalized" ]]; then
+          event_epoch=$(date -d "$dt_normalized" +%s 2>/dev/null || date -d "$dt_clean_normalized" +%s 2>/dev/null || date -d "$dt_clean" +%s 2>/dev/null || echo "")
+        fi
+        recent_display_parts+=("$display_entry")
+        parsed_events+=("${severity_upper}${sep}${event_epoch}${sep}${display_entry}")
+      done
+
+      if (( ${#recent_display_parts[@]} > 0 )); then
+        recent_events_display=$(IFS='; '; echo "${recent_display_parts[*]}")
+        recent_events_value=$(IFS='; '; echo "${recent_display_parts[*]}")
+        recent_events_value=$(echo "$recent_events_value" | xargs)
+        [[ -z "$recent_events_value" ]] && recent_events_value="none"
+      fi
+
+      local primary_severity=""
+      local primary_event_epoch=""
+      local -a extra_events=()
+      for parsed in "${parsed_events[@]}"; do
+        IFS=$'\x1E' read -r sev epoch_ts display_text <<< "$parsed"
+        case "$sev" in
+          CRIT)
+            if [[ "$primary_severity" != "CRIT" ]]; then
+              if [[ -n "$primary_event" ]]; then
+                extra_events+=("$primary_event")
+              fi
+              primary_event="$display_text"
+              primary_severity="CRIT"
+              primary_event_epoch="$epoch_ts"
+            else
+              extra_events+=("$display_text")
+            fi
+            ;;
+          WARN)
+            if [[ -z "$primary_event" || "$primary_severity" != "CRIT" ]]; then
+              if [[ -n "$primary_event" && "$primary_severity" == "WARN" ]]; then
+                extra_events+=("$primary_event")
+              fi
+              primary_event="$display_text"
+              primary_severity="WARN"
+              primary_event_epoch="$epoch_ts"
+            else
+              extra_events+=("$display_text")
+            fi
+            ;;
+          *)
+            if [[ -n "$primary_event" ]]; then
+              extra_events+=("$display_text")
+            fi
+            ;;
+        esac
+      done
+
+      if [[ -n "$primary_event" && -n "$primary_severity" && "$primary_severity" != "INFO" ]]; then
+        last_event_type="$primary_severity"
+        if [[ -n "$primary_event_epoch" && "$primary_event_epoch" =~ ^[0-9]+$ ]]; then
+          local delta=$(( SCRIPT_START_TS - primary_event_epoch ))
+          (( delta < 0 )) && delta=0
+          last_event_days=$(( (delta + 43200) / 86400 ))
+          days_since_display="$last_event_days"
+        else
+          last_event_days=""
+        fi
+
+        local days_label="N/A"
+        if [[ -n "$last_event_days" ]]; then
+          days_label="$last_event_days"
+        elif [[ "$days_since_display" =~ ^[0-9]+$ ]]; then
+          days_label="$days_since_display"
+        fi
+
+        recent_clause="最近一次 ${primary_severity} 事件為 ${days_label} 天前：${primary_event}"
+        if (( ${#extra_events[@]} > 0 )); then
+          declare -A _seen_recent_extra=()
+          local -a unique_extras=()
+          for extra_entry in "${extra_events[@]}"; do
+            [[ -z "$extra_entry" ]] && continue
+            if [[ -z "${_seen_recent_extra["$extra_entry"]:-}" ]]; then
+              _seen_recent_extra["$extra_entry"]=1
+              unique_extras+=("$extra_entry")
+            fi
+          done
+          if (( ${#unique_extras[@]} > 0 )); then
+            local extras_join
+            extras_join=$(IFS='; '; echo "${unique_extras[*]}")
+            recent_clause+="; 其他：${extras_join}"
+          fi
+        fi
+      fi
     fi
-    recent_clause="最近一次 ${event_type_label} 事件為 ${days_label} 天前：${primary_event}${extra_clause}"
   fi
 
   echo "[SEL] days_since_last=${days_since_display}" >&2
@@ -4287,8 +4528,8 @@ check_bmc() {
       fi
       ;;
     WARN)
-      local warn_days_label="${last_event_days:-未知}"
-      if [[ "$warn_days_label" == "未知" && "$days_since_display" =~ ^[0-9]+$ ]]; then
+      local warn_days_label="${last_event_days:-N/A}"
+      if [[ "$warn_days_label" == "N/A" && "$days_since_display" =~ ^[0-9]+$ ]]; then
         warn_days_label="$days_since_display"
       fi
       local warn_type_label="${last_event_type:-CRIT/WARN}"
@@ -4299,8 +4540,8 @@ check_bmc() {
       fi
       ;;
     FAIL)
-      local fail_days_label="${last_event_days:-未知}"
-      if [[ "$fail_days_label" == "未知" && "$days_since_display" =~ ^[0-9]+$ ]]; then
+      local fail_days_label="${last_event_days:-N/A}"
+      if [[ "$fail_days_label" == "N/A" && "$days_since_display" =~ ^[0-9]+$ ]]; then
         fail_days_label="$days_since_display"
       fi
       local fail_type_label="${last_event_type:-CRIT/WARN}"
@@ -4345,7 +4586,6 @@ check_bmc() {
   local jdg_json
   jdg_json=$(build_judgement "$criteria" "$pass_rules" "$warn_rules" "$fail_rules" "$checks_json" "$th_json")
 
-  fi
   set_check_result_with_jdg 12 "$final_json" "$jdg_json"
 }
 
