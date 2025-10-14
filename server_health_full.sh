@@ -191,7 +191,7 @@ CABLE_MAX_FLAPS=10
 CABLE_WARN_HALF=1
 
 # SEL analysis params
-RECOVER_DAYS=30
+: "${RECOVER_DAYS:=30}"
 LOG_DAYS=1 # NEW: Days to look back for system logs (journalctl)
 # === CONSOLIDATE END ===
 
@@ -216,6 +216,8 @@ print_usage() {
     --env-temp-warn <N>      (預設: $ENV_TEMP_WARN)
     --env-temp-crit <N>      (預設: $ENV_TEMP_CRIT)
     --fan-th <N>
+    FAN_BASELINE_FILE=<path> (環境變數，可覆寫 baseline 檔案路徑，預設 logs/fan_baseline.json)
+    FAN_BASELINE_RESET=1     (環境變數，下一次執行時重建風扇 baseline)
   磁碟 I/O:
     --run-fio
     --fio-file <path>        --fio-size <size>
@@ -3377,9 +3379,12 @@ check_fans() {
     # Quick verify: jq '.items[] | select(.id==7) | .evidence' logs/*_latest.json
 
     # Define paths
+    : "${FAN_BASELINE_FILE:=${LOG_DIR:-logs}/fan_baseline.json}"
+    : "${FAN_BASELINE_RESET:=0}"
+
     local raw_sensors_log="${LOG_DIR}/sensors_output_${TIMESTAMP}.log" # This file is already created by check_cpu
     local raw_ipmi_sdr_log="${LOG_DIR}/ipmi_sdr_fan_${TIMESTAMP}.log"
-    local baseline_path="${LOG_DIR}/fan_baseline.json"
+    local baseline_path="$FAN_BASELINE_FILE"
     local metrics_dir="${LOG_DIR}/fan"
     local metrics_path="${metrics_dir}/metrics_${TIMESTAMP}.json"
     mkdir -p "${metrics_dir}"
@@ -3410,13 +3415,49 @@ check_fans() {
         return
     fi
 
-    # Read or create file-based baseline from previous OS-level sensor readings
-    declare -A FILE_BASELINE_RPM
-    if [[ -f "$baseline_path" && "${RE_BASELINE:-false}" != "true" ]]; then
-        mapfile -t fan_keys < <(jq -r 'keys[]' "$baseline_path" 2>/dev/null || true)
-        for key in "${fan_keys[@]}"; do
-            FILE_BASELINE_RPM["$key"]=$(jq -r ".\"$key\"" "$baseline_path")
-        done
+    # Collect OS-level fan readings to seed or compare with baseline
+    local -a current_fans=()
+    local -a os_fan_data=()
+    if [[ -n "$fan_out" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local fan_name
+            fan_name=$(echo "$line" | awk -F: '{print $1}' | xargs | tr ' ' '_' | tr -d '-')
+            [[ -z "$fan_name" ]] && continue
+            local current_rpm
+            current_rpm=$(echo "$line" | grep -oP '[0-9]+' | head -n1)
+            [[ -z "$current_rpm" ]] && continue
+            os_fan_data+=("${fan_name}|${current_rpm}")
+            current_fans+=("${fan_name}|${current_rpm}")
+        done <<< "$fan_out"
+    fi
+
+    local baseline_dir
+    baseline_dir=$(dirname "$baseline_path")
+    mkdir -p "$baseline_dir" 2>/dev/null || true
+
+    local current_fans_json
+    current_fans_json=$(printf '%s\n' "${current_fans[@]}" | jq -R 'select(length>0) | split("|") | {name:.[0], baseline_rpm:(.[1]|tonumber?)}' | jq -s '.')
+    [[ -z "$current_fans_json" ]] && current_fans_json='[]'
+
+    local baseline_initialized=0
+    if [[ "$FAN_BASELINE_RESET" == "1" ]] || [[ ! -s "$baseline_path" ]]; then
+        baseline_initialized=1
+        jq -n --argjson arr "$current_fans_json" \
+           '$arr as $a | {fans: ($a | map({name:.name, baseline_rpm:(.baseline_rpm // 0)}))}' \
+           > "$baseline_path"
+        echo "[Info] fan baseline initialized: $baseline_path"
+    fi
+
+    declare -A FAN_BASELINE=()
+    if [[ -s "$baseline_path" ]] && (( baseline_initialized == 0 )); then
+        while IFS= read -r line; do
+            local name
+            name=$(jq -r '.name' <<<"$line")
+            local brpm
+            brpm=$(jq -r '.baseline_rpm // 0' <<<"$line")
+            [[ -n "$name" ]] && FAN_BASELINE["$name"]="$brpm"
+        done < <(jq -c '.fans[]?' "$baseline_path" 2>/dev/null || true)
     fi
 
     local low_rpm_count=0
@@ -3425,80 +3466,114 @@ check_fans() {
     local metrics_json_array=()
     local reason_details=()
     local fan_summary_array=() # For PASS reason summary
-    local needs_baseline_update=0
-    local -a fan_details=()
     local -a fan_checks_entries=()
+    local -a fan_eval_entries=()
     local fan_checks_limit=8
     local fan_checks_added=0
     local worst_deviation_abs=""
     local worst_deviation_signed=""
     local worst_fan=""
+    local baseline_values_present=0
 
-    # --- Process OS-level `sensors` data ---
-    while read -r line; do
-        local fan_name=$(echo "$line" | awk -F: '{print $1}' | xargs | tr ' ' '_' | tr -d '-')
-        local current_rpm=$(echo "$line" | grep -oP '[0-9]+' | head -n1)
-        [[ -z "$current_rpm" ]] && continue
+    for entry in "${os_fan_data[@]}"; do
+        IFS='|' read -r fan_name current_rpm <<< "$entry"
+        [[ -z "$fan_name" || -z "$current_rpm" ]] && continue
 
-        local baseline_rpm=0
+        local base="${FAN_BASELINE["$fan_name"]:-0}"
         local baseline_source="none"
-        if [[ -n "${FILE_BASELINE_RPM[$fan_name]:-}" ]]; then
-            baseline_rpm=${FILE_BASELINE_RPM[$fan_name]}
-            baseline_source="file"
-        else
-            baseline_rpm=$current_rpm
-            FILE_BASELINE_RPM["$fan_name"]=$current_rpm
-            needs_baseline_update=1
-            baseline_source="new"
-        fi
-
+        local base_disp="N/A"
+        local dev_disp="N/A"
         local deviation_pct_signed=""
         local deviation_pct_abs=""
         local deviation_pct_abs_int=0
-        if (( baseline_rpm > 50 )); then
-            deviation_pct_signed=$(awk -v cur="$current_rpm" -v base="$baseline_rpm" 'BEGIN { if (base!=0) printf "%.1f", (cur-base)*100/base }')
+
+        if [[ "$base" =~ ^[0-9]+$ && "$base" -gt 0 && "$current_rpm" =~ ^[0-9]+$ ]]; then
+            baseline_source="file"
+            base_disp="$base"
+            deviation_pct_signed=$(awk -v c="$current_rpm" -v b="$base" 'BEGIN { if (b>0) printf "%.1f", (c-b)*100.0/b }')
             if [[ -n "$deviation_pct_signed" ]]; then
+                baseline_values_present=1
                 deviation_pct_abs=$(awk -v v="$deviation_pct_signed" 'BEGIN { if (v<0) v=-v; printf "%.1f", v }')
                 deviation_pct_abs_int=$(awk -v v="$deviation_pct_abs" 'BEGIN { printf "%.0f", v }')
+                local deviation_pct_int
+                deviation_pct_int=$(awk -v v="$deviation_pct_signed" 'BEGIN { printf "%.0f", v }')
+                dev_disp="${deviation_pct_int}%"
             fi
         fi
 
         local fan_status="OK"
         if (( current_rpm < 100 )); then
-            ((low_rpm_count++)); fan_status="CRIT (Stopped)"; reason_details+=("${fan_name}:${current_rpm}RPM")
-        elif (( deviation_pct_abs_int > 40 )); then
-            ((deviation_crit_count++)); fan_status="CRIT (Dev >40%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
+            ((low_rpm_count++))
+            fan_status="CRIT (Stopped)"
+            reason_details+=("${fan_name}:${current_rpm}RPM")
+        elif (( deviation_pct_abs_int > ${DEVIATION_CRIT_PCT:-0} )); then
+            ((deviation_crit_count++))
+            fan_status=$(printf 'CRIT (Dev >%s%%)' "$DEVIATION_CRIT_PCT")
+            if [[ -n "$deviation_pct_abs" ]]; then
+                reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
+            else
+                reason_details+=("${fan_name}:${current_rpm}RPM")
+            fi
         elif (( current_rpm < FAN_RPM_TH )); then
-            ((low_rpm_count++)); fan_status="WARN (<${FAN_RPM_TH}RPM)"; reason_details+=("${fan_name}:${current_rpm}RPM")
-        elif (( deviation_pct_abs_int > 20 )); then
-            ((deviation_warn_count++)); fan_status="WARN (Dev >20%)"; reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
+            ((low_rpm_count++))
+            fan_status="WARN (<${FAN_RPM_TH}RPM)"
+            reason_details+=("${fan_name}:${current_rpm}RPM")
+        elif (( deviation_pct_abs_int > ${DEVIATION_WARN_PCT:-0} )); then
+            ((deviation_warn_count++))
+            fan_status=$(printf 'WARN (Dev >%s%%)' "$DEVIATION_WARN_PCT")
+            if [[ -n "$deviation_pct_abs" ]]; then
+                reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
+            else
+                reason_details+=("${fan_name}:${current_rpm}RPM")
+            fi
         fi
-        
-        local deviation_json="null"
-        [[ -n "$deviation_pct_signed" ]] && deviation_json="$deviation_pct_signed"
-        metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --argjson base_rpm "$( [[ -n "$baseline_rpm" ]] && echo "$baseline_rpm" || echo null )" --arg bsrc "$baseline_source" --argjson dev_pct "$deviation_json" \
-            '{name:$name, status:$status, current_rpm:$rpm, baseline_rpm:$base_rpm, baseline_source:$bsrc, deviation_pct:$dev_pct}') )
+
+        metrics_json_array+=( $(jq -n \
+            --arg name "$fan_name" \
+            --arg status "$fan_status" \
+            --argjson rpm "$current_rpm" \
+            --arg bsrc "$baseline_source" \
+            --arg base_disp "$base_disp" \
+            --arg dev_disp "$dev_disp" \
+            '{
+               name:$name,
+               status:$status,
+               current_rpm:$rpm,
+               baseline_source:$bsrc
+             }
+             + (if $base_disp!="N/A" then {baseline_rpm: ($base_disp|tonumber)} else {} end)
+             + (if $dev_disp!="N/A" then {deviation_pct: ($dev_disp|sub("%$";"")|tonumber)} else {} end)') )
 
         local fan_ok="true"
         [[ "$fan_status" == WARN* || "$fan_status" == CRIT* || "$fan_status" == FAIL* ]] && fan_ok="false"
         if (( fan_checks_added < fan_checks_limit )); then
-            local base_display="${baseline_rpm:-N/A}"
-            [[ -z "$baseline_rpm" ]] && base_display="N/A"
-            local dev_display="N/A"
-            if [[ -n "$deviation_pct_signed" ]]; then
-                dev_display=$(awk -v v="$deviation_pct_signed" 'BEGIN{printf "%+.1f%%", v+0}')
-            fi
             fan_checks_entries+=( "$(jq -n \
                 --arg name "$fan_name" \
                 --arg ok "$fan_ok" \
                 --arg cur "$current_rpm" \
-                --arg base "$base_display" \
-                --arg dev "$dev_display" \
+                --arg base "$base_disp" \
+                --arg dev "$dev_disp" \
                 '{name:$name, ok:($ok=="true"), value:("cur="+$cur+", base="+$base+", dev="+$dev)}')" )
             fan_checks_added=$((fan_checks_added+1))
         fi
 
-        fan_details+=( "$fan_name|$current_rpm|${baseline_rpm:-}|${deviation_pct_signed:-}|$fan_status|$baseline_source" )
+        local fan_eval_entry
+        fan_eval_entry=$(jq -n \
+            --arg name "$fan_name" \
+            --arg status "$fan_status" \
+            --arg bsrc "$baseline_source" \
+            --argjson rpm "$current_rpm" \
+            --arg base_disp "$base_disp" \
+            --arg dev_disp "$dev_disp" \
+            '{
+               name:$name,
+               status:$status,
+               baseline_source:$bsrc,
+               rpm:$rpm
+             }
+             + (if $base_disp!="N/A" then {baseline_rpm: ($base_disp|tonumber)} else {} end)
+             + (if $dev_disp!="N/A" then {deviation_pct: ($dev_disp|sub("%$";"")|tonumber)} else {} end)')
+        fan_eval_entries+=("$fan_eval_entry")
 
         if [[ -n "$deviation_pct_abs" ]]; then
             if [[ -z "$worst_deviation_abs" ]] || [[ $(awk -v a="$deviation_pct_abs" -v b="$worst_deviation_abs" 'BEGIN{print (a>b)?1:0}') == 1 ]]; then
@@ -3507,27 +3582,39 @@ check_fans() {
                 worst_fan="$fan_name"
             fi
         fi
-
-    done <<< "$fan_out"
+    done
 
     # --- Process IPMI SDR data ---
     if [[ -n "$ipmi_sdr_out" ]]; then
         while read -r line; do
             echo "$line" | grep -q "RPM" || continue
 
-            local fan_name; fan_name=$(echo "$line" | cut -d'|' -f1 | xargs | tr ' ' '_' | tr -d '-')
-            local current_rpm; current_rpm=$(echo "$line" | cut -d'|' -f5 | grep -oE '[0-9]+' | head -n 1)
+            local fan_name
+            fan_name=$(echo "$line" | cut -d'|' -f1 | xargs | tr ' ' '_' | tr -d '-')
+            local current_rpm
+            current_rpm=$(echo "$line" | cut -d'|' -f5 | grep -oE '[0-9]+' | head -n 1)
             [[ -z "$fan_name" || -z "$current_rpm" ]] && continue
 
             local fan_status="OK"
             if (( current_rpm < FAN_RPM_TH )); then
-                ((low_rpm_count++)); fan_status="WARN (<${FAN_RPM_TH}RPM)"; reason_details+=("${fan_name}:${current_rpm}RPM")
+                ((low_rpm_count++))
+                fan_status="WARN (<${FAN_RPM_TH}RPM)"
+                reason_details+=("${fan_name}:${current_rpm}RPM")
             fi
             fan_summary_array+=("${fan_name}|${current_rpm}|${FAN_RPM_TH}")
             echo "DEBUG FAN: ${fan_name}|${current_rpm}|${FAN_RPM_TH}" >&2
 
-            metrics_json_array+=( $(jq -n --arg name "$fan_name" --arg status "$fan_status" --argjson rpm "$current_rpm" --arg bsrc "ipmi" \
-                '{name:$name, status:$status, current_rpm:$rpm, baseline_source:$bsrc, deviation_pct:null, baseline_rpm:null}') )
+            metrics_json_array+=( $(jq -n \
+                --arg name "$fan_name" \
+                --arg status "$fan_status" \
+                --argjson rpm "$current_rpm" \
+                --arg bsrc "ipmi" \
+                '{
+                   name:$name,
+                   status:$status,
+                   current_rpm:$rpm,
+                   baseline_source:$bsrc
+                 }') )
 
             local fan_ok="true"
             [[ "$fan_status" == WARN* || "$fan_status" == CRIT* || "$fan_status" == FAIL* ]] && fan_ok="false"
@@ -3536,35 +3623,27 @@ check_fans() {
                     --arg name "$fan_name" \
                     --arg ok "$fan_ok" \
                     --arg cur "$current_rpm" \
-                    '{name:$name, ok:($ok=="true"), value:("cur="+$cur+", base=N/A, dev=N/A")}')" )
+                    --arg base "N/A" \
+                    --arg dev "N/A" \
+                    '{name:$name, ok:($ok=="true"), value:("cur="+$cur+", base="+$base+", dev="+$dev)}')" )
                 fan_checks_added=$((fan_checks_added+1))
             fi
-            fan_details+=( "$fan_name|$current_rpm|||$fan_status|ipmi" )
-        done <<< "$ipmi_sdr_out"
-    fi
 
-    # [FIX] Corrected if statement syntax
-    if (( needs_baseline_update )) || [[ "${RE_BASELINE:-false}" == "true" ]]; then
-        jq -n '$ARGS.positional | . as $a | reduce ($a | length - 1) as $i (-1; . + {($a[$i*2]): ($a[$i*2+1]|tonumber)})' --args "${!FILE_BASELINE_RPM[@]}" "${FILE_BASELINE_RPM[@]}" > "$baseline_path"
-        echo "[INFO] Fan baseline updated: $baseline_path"
+            local ipmi_eval_entry
+            ipmi_eval_entry=$(jq -n \
+                --arg name "$fan_name" \
+                --arg status "$fan_status" \
+                --arg bsrc "ipmi" \
+                --argjson rpm "$current_rpm" \
+                '{name:$name, status:$status, baseline_source:$bsrc, rpm:$rpm}')
+            fan_eval_entries+=("$ipmi_eval_entry")
+        done <<< "$ipmi_sdr_out"
     fi
 
     local fan_eval_file="${metrics_dir}/fan_eval_${TIMESTAMP}.json"
     local fan_eval_entries_json='[]'
-    if (( ${#fan_details[@]} > 0 )); then
-        fan_eval_entries_json=$(printf '%s\n' "${fan_details[@]}" | jq -s -R '
-          split("\n")
-          | map(select(length>0))
-          | map(split("|"))
-          | map({
-              name: .[0],
-              rpm: (if .[1]=="" then null else (.[1]|tonumber) end),
-              baseline_rpm: (if (length>2 and .[2]!="") then (.[2]|tonumber) else null end),
-              dev_pct: (if (length>3 and .[3]!="") then (.[3]|tonumber) else null end),
-              status: (if length>4 then .[4] else null end),
-              baseline_source: (if length>5 then .[5] else null end)
-            })
-        ')
+    if (( ${#fan_eval_entries[@]} > 0 )); then
+        fan_eval_entries_json=$(printf '%s\n' "${fan_eval_entries[@]}" | jq -s '.')
     fi
     local fan_eval_thresholds_json
     fan_eval_thresholds_json=$(jq -n \
@@ -3596,33 +3675,35 @@ check_fans() {
     fi
 
     local fan_zone_summary=""
-    local -a _fan_zone_lines=()
-    if [[ -f "$raw_ipmi_sdr_log" ]]; then
-        mapfile -t _fan_zone_lines < <(grep -E 'Fan[ _]?Zone[[:space:]_]*[0-9]+' "$raw_ipmi_sdr_log" 2>/dev/null || true)
-    elif [[ -n "$ipmi_sdr_out" ]]; then
-        mapfile -t _fan_zone_lines < <(printf '%s\n' "$ipmi_sdr_out" | grep -E 'Fan[ _]?Zone[[:space:]_]*[0-9]+' || true)
-    else
-        _fan_zone_lines=()
-    fi
-    if (( ${#_fan_zone_lines[@]} > 0 )); then
-        declare -A _seen_fan_zones=()
-        local -a _fan_zone_parts=()
-        for _zone_line in "${_fan_zone_lines[@]}"; do
-            if [[ $_zone_line =~ Fan[[:space:]_]*Zone[[:space:]_]*([0-9]+).*?([0-9]+)[[:space:]]*percent ]]; then
-                local _zone_id="${BASH_REMATCH[1]}"
-                local _zone_pct="${BASH_REMATCH[2]}"
-                local _zone_label="Z${_zone_id}"
-                if [[ -z "${_seen_fan_zones["$_zone_label"]:-}" ]]; then
-                    _seen_fan_zones["$_zone_label"]=1
-                    _fan_zone_parts+=("${_zone_label}=${_zone_pct}%")
-                fi
-            fi
-        done
-        if (( ${#_fan_zone_parts[@]} > 0 )); then
-            local _zone_join
-            _zone_join=$(IFS=', '; echo "${_fan_zone_parts[*]}")
-            fan_zone_summary="Zones: ${_zone_join}"
+    declare -a _fan_zone_parts=()
+    declare -A _seen_fan_zones=()
+
+    local -a _zone_lines=()
+    mapfile -t _zone_lines < <(
+      if [[ -f "$raw_ipmi_sdr_log" ]]; then
+        grep -E '^[[:space:]]*Fan[ _]?Zone[[:space:]_]*[0-9]+' "$raw_ipmi_sdr_log" || true
+      elif [[ -n "$ipmi_sdr_out" ]]; then
+        printf '%s\n' "$ipmi_sdr_out" | grep -E '^[[:space:]]*Fan[ _]?Zone[[:space:]_]*[0-9]+' || true
+      fi
+    )
+
+    for L in "${_zone_lines[@]}"; do
+      IFS='|' read -r c1 c2 c3 c4 c5 <<<"$L"
+      local zone_id
+      zone_id=$(printf '%s' "$c1" | grep -Eo 'Fan[ _]?Zone[ _]*[0-9]+' | grep -Eo '[0-9]+')
+      local pct
+      pct=$(printf '%s' "$c5" | grep -Eo '[0-9]+[[:space:]]*percent' | grep -Eo '^[0-9]+')
+      if [[ -n "$zone_id" && -n "$pct" ]]; then
+        local label="Z${zone_id}"
+        if [[ -z "${_seen_fan_zones[$label]:-}" ]]; then
+          _seen_fan_zones[$label]=1
+          _fan_zone_parts+=("${label}=${pct}%")
         fi
+      fi
+    done
+
+    if (( ${#_fan_zone_parts[@]} > 0 )); then
+      fan_zone_summary="Zones: $(IFS=', '; echo "${_fan_zone_parts[*]}")"
     fi
 
     local worst_dev_summary=""
@@ -3642,6 +3723,10 @@ check_fans() {
                 worst_dev_summary="worst dev=${_worst_dev_int}%"
             fi
         fi
+    fi
+
+    if [[ -z "$worst_dev_summary" && $baseline_values_present -eq 0 && ${#fan_eval_entries[@]} -gt 0 ]]; then
+        worst_dev_summary="worst dev=N/A"
     fi
 
     local fan_reason_suffix=""
@@ -4564,19 +4649,33 @@ check_bmc() {
     --arg recover "$RECOVER_DAYS" \
     '{SEL_DAYS: ($sel_days|tonumber), RECOVER_DAYS: ($recover|tonumber)}')
 
-  local checks_json
-  checks_json=$(jq -n \
+  local -a sel_checks_entries=()
+  sel_checks_entries+=( "$(jq -n \
     --arg crit "$SEL_CRIT" \
+    '{name:"SEL CRIT 事件=0", ok:(($crit|tonumber)==0), value:("crit="+$crit)}')" )
+  sel_checks_entries+=( "$(jq -n \
     --arg warn "$SEL_WARN" \
+    '{name:"SEL WARN 事件=0", ok:(($warn|tonumber)==0), value:("warn="+$warn)}')" )
+  sel_checks_entries+=( "$(jq -n \
     --arg info "$SEL_INFO" \
-    --arg days_since "$days_since_display" \
+    '{name:"SEL INFO 事件計數", ok:true, value:("info="+$info)}')" )
+  sel_checks_entries+=( "$(jq -n \
+    --arg ds "${days_since_display:-}" \
+    --argjson rec "$RECOVER_DAYS" \
+    'if ($ds|test("^[0-9]+$")) then
+       {name:"Days since last CRIT/WARN", ok:(($ds|tonumber) >= rec), value:("days="+$ds+", RECOVER_DAYS="+(rec|tostring))}
+     else
+       {name:"Days since last CRIT/WARN", ok:true, value:"none"}
+     end')" )
+  sel_checks_entries+=( "$(jq -n \
     --arg recent "$recent_events_value" \
-    --argjson recent_ok "$recent_ok_str" \
-    '[{"name":"SEL CRIT 事件=0","ok":($crit|tonumber==0),"value":("crit="+$crit)},
-      {"name":"SEL WARN 事件=0","ok":($warn|tonumber==0),"value":("warn="+$warn)},
-      {"name":"SEL INFO 事件計數","ok":true,"value":("info="+$info)},
-      {"name":"距上次 CRIT/WARN 天數","ok":true,"value":("days_since_last="+$days_since)},
-      {"name":"recent SEL events","ok":$recent_ok,"value":$recent}]')
+    --arg ok_str "$recent_ok_str" \
+    '{name:"recent SEL events", ok:($ok_str=="true"), value:$recent}')" )
+
+  local checks_json='[]'
+  if (( ${#sel_checks_entries[@]} > 0 )); then
+    checks_json=$(printf '%s\n' "${sel_checks_entries[@]}" | jq -s '.')
+  fi
 
   local pass_rules='["SEL_DAYS 視窗內 CRIT=0 且 WARN=0"]'
   local warn_rules='["SEL WARN>0 但 CRIT=0"]'
