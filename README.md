@@ -26,7 +26,7 @@ Refs: 2204-2207,2254-2257
 - days_since_last = (now - last_ts) / 86400
 - PASS: "過去 ${SEL_DAYS} 天內無 CRIT/WARN；距今已 X 天未再發"
 - WARN/FAIL: "SEL CRIT=… WARN=… (最近一次 CRIT/WARN 為 X 天前)"
-- checks 增加：「距上次 CRIT/WARN 天數」
+- checks 增加：「距上次 CRIT/WARN 天數」；judgement 加入 RECOVER_DAYS（預設 30 天）門檻
 Refs: 3012-3045
 
 4) ENV 鍵名統一
@@ -38,6 +38,11 @@ Refs: 2660-2661,2675
 - 重寫 check_gpu()，統一 set_check_result_with_jdg
 - checks 的 ok 值語意正確：nvidia-smi unavailable → ok:false（非 FAIL）
 - 完整 criteria + thresholds: {"GPU_TEMP_WARN":85,"GPU_TEMP_CRIT":92,"GPU_POWER_WATCH":0}
+
+6) Fan baseline / zones
+- 缺 baseline 時以當前 RPM 建檔但本次判斷顯示 base/dev=N/A，fan_eval JSON 不再輸出 null
+- 新環境變數：FAN_BASELINE_FILE 覆寫檔案路徑、FAN_BASELINE_RESET=1 重新播種 baseline
+- Fan Zone 摘要改為解析 SDR 最末欄的百分比數值
 Refs: 2266-2324
 
 ## 對照
