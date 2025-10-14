@@ -232,3 +232,152 @@ Refs: 2266-2324
   2. 第一次執行完整腳本
   3. 間隔 1-2 分鐘後第二次執行
   4. 檢查輸出是否符合預期
+
+20251012 12:45
+修復 check_disks() 輸出為 N/A 的問題（Item 2 應輸出 PASS/WARN/FAIL/INFO/SKIP）結果
+• - server_health_full.sh:1462-1704 重構 check_disks()，統一初始化門檻常數、建立 RAID/SMART/NVMe 目錄與紀錄檔，並在收集期間保留 controllers/arrays/devices
+    詳細資料以構成目標 metrics。
+  - server_health_full.sh:1905-2095 彙整各來源統計，判定 FAIL/WARN/INFO/SKIP，並生成摘要字串 RAID/...; SMART/...; NVMe/...（含 rebuild、alerts、NVMe 最高
+    溫度）供 Reason 使用。
+  - server_health_full.sh:2109-2179 改寫 checks_json（RAID controllers detected、RAID all VDs optimal、SMART FAILED=0 等）與 th_json，明確呈現主要指標與
+    門檻。
+  - server_health_full.sh:2184-2208 組合 evidence（storcli/smartctl/nvme 輸出路徑）、base_json 與 judgement，並以 set_check_result_with_jdg 2 "$base_json"
+    "$jdg_json" 單一路徑回報結果。
+
+  新的 checks_json 片段（server_health_full.sh:2109-2121）：
+
+  checks_entries+=("$(jq -n --arg controllers "$raid_controller_count" '{name:"RAID controllers detected", ok:(($controllers|tonumber)>0), value:
+  ("controllers="+$controllers)}')")
+  checks_entries+=("$(jq -n --arg vd_deg "$vd_degraded" --arg vd_fail "$vd_failed" '{name:"RAID all VDs optimal", ok:((($vd_deg|tonumber)==0) and
+  (($vd_fail|tonumber)==0)), value:("vd_degraded="+$vd_deg+", vd_failed="+$vd_fail)}')")
+  checks_entries+=("$(jq -n --arg smart_fail "$smart_failed_count" '{name:"SMART FAILED=0", ok:(($smart_fail|tonumber)==0), value:("failed="+
+  $smart_fail)}')")
+  checks_entries+=("$(jq -n --arg nvme_media "$nvme_media_err_count" '{name:"NVMe media_err=0", ok:(($nvme_media|tonumber)==0), value:("media_err="+
+  $nvme_media)}')")
+
+  Reason 示意：
+
+  - PASS：All disk, RAID, SMART, and NVMe checks passed. RAID: ctrl=2, vd_total=12, vd_dgrd=0, vd_fail=0, pd_fail=0, rebuild=0; SMART: disks=6, alerts=0;
+    NVMe: devices=2, alerts=0, max_temp=45°C
+  - WARN：RAID: ctrl=1, vd_total=8, vd_dgrd=1, vd_fail=0, pd_fail=0, rebuild=1; SMART: disks=5, alerts=realloc>0 on /dev/sdb; NVMe: devices=1,
+    alerts=media_err=1 on nvme0n1, max_temp=58°C [Key: 硬體 RAID: VD degraded=1; SMART realloc>0: /dev/sdb; NVMe media_errors>0: nvme0n1]
+
+  實測：在目前沙盒環境缺少 sudo/硬體工具且 Bash 版本不足以宣告 declare -A，./server_health_full.sh 無法成功執行；請於具備 storcli/smartctl/nvme 及適當權限
+  的目標主機執行確認，並檢查終端 Item 2 的 Reason 及 logs/*_latest.json 中 items[] 的 metrics/evidence/judgement 数据。
+
+修復Firmware（Item 14）取不到 BIOS 版本
+• Summary
+
+  - server_health_full.sh:568-592 調整 set_status 的韌體項目判斷，改以 BIOS_VERSION_CHECK_VALUE 與 FIRMWARE_ENUM_MESSAGE 填入 judgement，使成功時 value 為
+    true，失敗時帶出具體原因與 log 提示。
+  - server_health_full.sh:1459-2110 完整整合 RAID/SMART/NVMe 指標：統計 controllers/alerts，彙整成單一句 Reason 與 Key Checks；缺工具時標記 INFO/SKIP 並在
+    checks/value 中寫入跳過原因。
+  - server_health_full.sh:3889-4010 重寫 check_firmware()：先試 dmidecode -t bios，必要時改用 sudo -n，解析版本後 export BIOS_VERSION；建立 logs/firmware/
+    firmware_${TIMESTAMP}.log，記錄所有 Firmware 探測輸出並放入 evidence。
+
+  Key Checks Snippet
+
+  [
+    {"name":"BIOS version retrieved","ok":true,"value":"true"},
+    {"name":"Firmware enumeration","ok":true,"value":"captured in firmware_<ts>.log; log=logs/firmware/firmware_<ts>.log"},
+    {"name":"Manual comparison required","ok":true,"value":"Human review needed"}
+  ]
+
+  Reason 範例
+
+  - 成功：列出 BIOS/NIC/GPU/Disk/NVMe (人工比對)；BIOS version: 2.1.0
+  - 權限不足：列出 BIOS/NIC/GPU/Disk/NVMe (人工比對)；BIOS: permission denied (sudo password required)
+
+  Verification
+
+  1. 於具備 dmidecode/smartctl/nvme/ethtool 與 sudo 權限的主機執行 ./server_health_full.sh --skip-bmc --offline --no-color.
+  2. 確認 Item 14 的 Key Checks BIOS version retrieved 顯示 value: "true"（或錯誤訊息），Reason 附帶版本或錯誤說明，LOGS 中含 logs/firmware/
+     firmware_<timestamp>.log.
+  3. 若無權限或工具，Reason/Checks 會顯示 dmidecode not available 或 permission denied，狀態為 INFO/SKIP。
+
+SEL 沒顯示「最近一次 CRIT/WARN 為 X 天前」與事件清單（Item 12）
+• 變更重點
+
+  - server_health_full.sh:1459-2110 重構 check_disks()，彙整 RAID/SMART/NVMe 指標，Reason 自動帶出 ctrl/alerts 摘要，Key Checks 顯示各類數值並在缺工具/權
+    限時標記 INFO/SKIP 與跳過原因，Evidence 指向彙總 log。
+  - server_health_full.sh:568-592 更新 item 14 judgement，BIOS version retrieved 會顯示 true 或具體錯誤字串，Firmware enumeration value 改為顯示 log 名
+    稱。
+  - server_health_full.sh:3889-4083 重寫 check_firmware()：階層式嘗試 dmidecode → sudo -n dmidecode，解析 BIOS 版本後 export，建立 logs/firmware/
+    firmware_<timestamp>.log，將 metrics/evidence 寫回 ALL_CHECK_RESULTS 並同步 judgement checks 的 value。
+
+  Key Checks 範例
+
+  {
+    "name": "BIOS version retrieved",
+    "ok": true,
+    "value": "true"
+  }
+
+  Reason 範例
+
+  - PASS：All disk, RAID, SMART, and NVMe checks passed. RAID: ctrl=2, vd_total=12, vd_dgrd=0, vd_fail=0, pd_fail=0, rebuild=0; SMART: disks=6, alerts=0;
+    NVMe: devices=2, alerts=0, max_temp=45°C
+  - WARN：RAID: ctrl=1, vd_total=8, vd_dgrd=1, vd_fail=0, pd_fail=0, rebuild=1; SMART: disks=5, alerts=realloc>0 on /dev/sdb; NVMe: devices=1,
+    alerts=media_err=1 on nvme0n1, max_temp=58°C [Key: 硬體 RAID: VD degraded=1; SMART realloc>0: /dev/sdb; NVMe media_errors>0: nvme0n1]
+
+  建議驗證
+
+  1. 於具備 dmidecode/smartctl/nvme 並可使用 sudo 的主機執行 ./server_health_full.sh --skip-bmc --offline --no-color。
+  2. 檢查 Item 14 Key Checks 是否出現 BIOS version retrieved: value=true，Reason 是否附帶 BIOS 版本，LOGS 中列出 logs/firmware/firmware_<timestamp>.log。
+  3. 檢視 logs/*_latest.json 內 items[] | select(.id==2 or .id==14)，確認 metrics/evidence/judgement 已包含上述資訊。
+  4. 若工具/權限缺失，確認 Reason 與 Key Checks 會顯示對應錯誤字串與 INFO/SKIP 狀態。
+
+  （沙盒受限無法實際執行完整腳本，如需進一步驗證請在目標環境測試。）
+  
+修復FAN 偏差的「證據可看」與數字呈現（Item 7）
+• - server_health_full.sh 的 check_disks() 現在會同時彙整 RAID/SMART/NVMe 指標：Reason 直接列出 ctrl/alerts 摘要，Key Checks 新增各類數值 (含缺工具
+    情境)，Evidence 指向 baseline、smart/nvme 彙總檔。BMC 判斷 (item12) 也會加上距上次事件天數、最近 5 筆 CRIT/WARN 清單並將 SEL_DAYS/RECOVER_DAYS
+    寫入 thresholds。check_firmware() 改為分層執行 dmidecode -> sudo -n dmidecode，將 BIOS 版本填入 env/export，記錄原始輸出於 logs/firmware/
+    firmware_<timestamp>.log，並把錯誤類型寫入 reason 與 judgement value。
+  - check_fans() 讀 baseline 後換算每顆風扇偏差百分比，計算最差值與名稱；Reason 會附加 Worst deviation 說明，Judgement Key Checks 額外列出最多 8 筆
+    Fan_NAME（cur/base/dev），完整列表寫入 logs/fan/fan_eval_<timestamp>.json 並放進 evidence（連同 baseline、sensors/ipmi log）。門檻 Checks 的第一段與新
+    增的 per-fan checks 會一起輸出，便於審計。
+
+ENV 與其他 Criteria 字串中的變數未展開（顯示 ${ENV_TEMP_WARN}）
+目標
+把人類可讀的 criteria 字串改為 雙引號 或字串拼接，確保變數（例如 ${ENV_TEMP_WARN}、${CPU_TEMP_WARN}）在建構 judgement 前就被展開。
+
+請修改/檢查：
+
+任何 criteria='環境溫度… ${ENV_TEMP_WARN}°C …'（單引號）一律改成：
+
+local criteria="環境溫度：代表性傳感器（Inlet/Ambient）最大值 ≤ WARN（${ENV_TEMP_WARN}°C）為 PASS；WARN < Max ≤ CRIT（${ENV_TEMP_CRIT}°C）為 WARN；Max > CRIT 為 FAIL。"
+
+
+同理套用到 CPU/NIC/其他項目；避免用單引號包住含 $變數 的字串。
+
+驗收
+
+Item 8 Env 的 Criteria 不再出現 ${ENV_TEMP_WARN} 這種原樣字串，而是實際數值。
+
+Item 4 CPU、其他項目也一致。
+
+建議執行順序
+
+先套 提示詞 5（變數展開）→ 立即讓 Criteria 顯示正確門檻。
+
+套 提示詞 3（SEL 天數 + 事件列舉）→ 你最有感的缺口。
+
+套 提示詞 4（FAN 證據）→ 讓「偏差有憑有據」。
+
+套 提示詞 2（Firmware）→ BIOS 版本進來。
+
+最後套 提示詞 1（Disks v2.3 輸出）→ 讓 Disk 從 N/A 變成完整 judgement。
+
+• I’m wrapping up a fix that removes unnecessary escaping so the ${ENV_TEMP_WARN} variable expands properly in server_health_full.sh at line 3559. I
+  double-checked CPU and NIC criteria strings and confirmed they already use double quotes, so no changes are needed there. Next, I’ll suggest rerunning
+  the relevant script to verify the update works as expected.
+
+─ Worked for 48s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Updated Item 8’s environment criteria to interpolate ${ENV_TEMP_WARN}/${ENV_TEMP_CRIT} before building the judgement so reports now show real numbers
+  instead of the literal variable names (server_health_full.sh:3559). CPU, NIC, and other criteria strings already used double quotes and didn’t need
+  changes.
+
+
+  
