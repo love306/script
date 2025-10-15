@@ -259,6 +259,184 @@ Exit Code:
 EOF
 }
 
+# ---------- datetime normalization helpers (SEL) ----------
+normalize_datetime() {
+  local s
+  s=$(cat | sed -e 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                -e 's/[[:space:]]T[[:space:]]/ /g' \
+                -e 's/,//g' \
+                -e 's/  \+/ /g')
+  [[ -z "$s" ]] && return 1
+
+  if [[ "$s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    printf '%s\n' "$s"; return 0
+  fi
+  if [[ "$s" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
+    printf '%04d-%02d-%02d %s\n' "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"; return 0
+  fi
+  if [[ "$s" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
+    printf '%04d-%02d-%02d %s\n' "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"; return 0
+  fi
+  if [[ "$s" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{2})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
+    printf '20%02d-%02d-%02d %s\n' "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"; return 0
+  fi
+  if [[ "$s" =~ ^([^[:space:]]+)[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+    local d="${BASH_REMATCH[1]}" t="${BASH_REMATCH[2]}"
+    normalize_datetime <<<"${d} ${t}" && return 0
+  fi
+  return 1
+}
+
+dt_to_epoch_or_empty() {
+  local n; n=$(normalize_datetime | tr -d $'\r')
+  [[ -z "$n" ]] && return 1
+  LC_ALL=C date -d "$n" +%s 2>/dev/null || true
+}
+
+# ---------- SEL helpers ----------
+sel_last_warn_crit_epoch() {
+  # uses env: SEL_EVENTS_JSON (structured), SEL_DETAIL_LOG (raw)
+  local latest=""
+  if [[ -s "$SEL_EVENTS_JSON" ]]; then
+    local lines
+    lines=$(jq -r '.[]? | select((.severity//"")|test("warn|crit";"i")) | (.datetime//empty)' "$SEL_EVENTS_JSON" 2>/dev/null)
+    if [[ -n "$lines" ]]; then
+      while IFS= read -r dt; do
+        [[ -z "$dt" ]] && continue
+        local ep
+        ep=$(printf '%s' "$dt" | dt_to_epoch_or_empty)
+        [[ -z "$ep" ]] && continue
+        if [[ -z "$latest" || "$ep" -gt "$latest" ]]; then latest="$ep"; fi
+      done <<< "$lines"
+    fi
+  fi
+  if [[ -z "$latest" && -s "$SEL_DETAIL_LOG" ]]; then
+    while IFS='|' read -r idx fdate ftime c1 c2 c3; do
+      fdate=$(echo "$fdate" | xargs); ftime=$(echo "$ftime" | xargs)
+      [[ -z "$fdate" || -z "$ftime" ]] && continue
+      local ep tail
+      ep=$(printf '%s %s' "$fdate" "$ftime" | dt_to_epoch_or_empty)
+      [[ -z "$ep" ]] && continue
+      tail="${c1} ${c2} ${c3}"
+      if echo "$tail" | grep -Eqi 'critical|warn|intrusion|FW Health|Failure|Over|Thermal'; then
+        if [[ -z "$latest" || "$ep" -gt "$latest" ]]; then latest="$ep"; fi
+      fi
+    done < <(grep -E '^\s*[0-9a-fA-F]+' "$SEL_DETAIL_LOG")
+  fi
+  [[ -n "$latest" ]] && printf '%s\n' "$latest"
+}
+
+cpu_history_upsert_and_stats() {
+  # args: cur_max avg_temp timestamp iso8601 history_file
+  local cur_max="$1" avg="$2" ts="$3" iso="$4" hist="$5"
+  local dir; dir=$(dirname "$hist"); mkdir -p "$dir"
+  local entry; entry=$(jq -n --arg iso "$iso" --argjson max "$cur_max" --argjson avg "$avg" '{ts:$iso, max:$max, avg:$avg}')
+  local now_epoch; now_epoch=$(date +%s)
+  local cutoff=$(( now_epoch - 90*86400 ))
+
+  local arr='[]'
+  [[ -s "$hist" ]] && arr=$(cat "$hist")
+  arr=$(jq --argjson cutoff "$cutoff" --argjson e "$entry" -n --argfile A <(printf '%s' "$arr") '
+    ($A + [$e])
+    | map(select(((.ts | try (strptime("%Y-%m-%d %H:%M:%S") | mktime) catch 0)) >= $cutoff))
+  ')
+  printf '%s\n' "$arr" > "$hist"
+
+  local peak avg90
+  peak=$(printf '%s' "$arr" | jq '[.[].max] | max // 0')
+  avg90=$(printf '%s' "$arr" | jq '([.[].avg] | add) / (length|if .==0 then 1 else . end)')
+  printf '%s|%s\n' "$peak" "$avg90"
+
+  if [[ "${CPU_DAILY_STATS:-0}" -eq 1 ]]; then
+    local daily
+    daily=$(printf '%s' "$arr" | jq '
+      map({
+        date: (.ts | try (strptime("%Y-%m-%d %H:%M:%S") | mktime | strftime("%Y-%m-%d")) catch null),
+        max: (.max // 0),
+        avg: (.avg // 0)
+      })
+      | map(select(.date != null))
+      | group_by(.date)
+      | map({
+          date: .[0].date,
+          peak_max: (map(.max) | (max // 0)),
+          avg_avg: (map(.avg) | if length==0 then 0 else (add/length) end)
+        })
+    ')
+    printf '%s\n' "${daily:-[]}" > "${hist%.json}_daily.json"
+  fi
+}
+
+fan_history_upsert_and_stats() {
+  # args:
+  # 1: fan_eval_entries_json (array of {name, rpm, ...})
+  # 2: timestamp (epoch)     3: iso8601   4: history_file
+  # stdout: JSON {overall:{avg_rpm_90d, peak_avg_rpm_90d}, per_fan:{<name>:{avg_90d, peak_90d}}}
+  local eval_json="$1" ts="$2" iso="$3" hist="$4"
+  local dir; dir=$(dirname "$hist"); mkdir -p "$dir"
+
+  local this_avg
+  this_avg=$(printf '%s' "$eval_json" | jq '[.[].rpm // empty] | if length==0 then 0 else (add/length) end')
+  local this_per_fan
+  this_per_fan=$(printf '%s' "$eval_json" | jq 'map({key:.name, val:(.rpm//0)}) | from_entries')
+
+  local now_epoch; now_epoch=$(date +%s)
+  local cutoff=$(( now_epoch - 90*86400 ))
+
+  local H='{"overall":[],"per_fan":{}}'
+  [[ -s "$hist" ]] && H=$(cat "$hist")
+
+  H=$(printf '%s' "$H" | jq --arg iso "$iso" --argjson avg "$this_avg" --argjson cutoff "$cutoff" '
+    .overall += [{ts:$iso, avg:$avg}] |
+    .overall = (.overall | map(select(((.ts | try (strptime("%Y-%m-%d %H:%M:%S") | mktime) catch 0)) >= $cutoff)))
+  ')
+
+  local fan_names; fan_names=$(printf '%s' "$this_per_fan" | jq -r 'keys[]?')
+  for f in $fan_names; do
+    local rpm; rpm=$(printf '%s' "$this_per_fan" | jq -r --arg k "$f" '.[$k]')
+    H=$(printf '%s' "$H" | jq --arg f "$f" --arg iso "$iso" --argjson rpm "$rpm" --argjson cutoff "$cutoff" '
+      .per_fan[$f] = ((.per_fan[$f] // []) + [{ts:$iso, rpm:$rpm}]) |
+      .per_fan[$f] = (.per_fan[$f] | map(select(((.ts | try (strptime("%Y-%m-%d %H:%M:%S") | mktime) catch 0)) >= $cutoff)))
+    ')
+  done
+
+  printf '%s\n' "$H" > "$hist"
+
+  local overall_avg overall_peak
+  overall_avg=$(printf '%s' "$H" | jq '([.overall[].avg] | if length==0 then 0 else (add/length) end)')
+  overall_peak=$(printf '%s' "$H" | jq '([.overall[].avg] | (max // 0))')
+
+  if [[ "${FAN_DAILY_STATS:-0}" -eq 1 ]]; then
+    local fan_daily
+    fan_daily=$(printf '%s' "$H" | jq '
+      .overall
+      | map({
+          date: (.ts | try (strptime("%Y-%m-%d %H:%M:%S") | mktime | strftime("%Y-%m-%d")) catch null),
+          avg: (.avg // 0)
+        })
+      | map(select(.date != null))
+      | group_by(.date)
+      | map({
+          date: .[0].date,
+          avg_rpm: (map(.avg) | if length==0 then 0 else (add/length) end),
+          peak_avg_rpm: (map(.avg) | (max // 0))
+        })
+    ')
+    printf '%s\n' "${fan_daily:-[]}" > "${hist%.json}_daily.json"
+  fi
+
+  printf '%s' "$H" | jq --argjson oa "$overall_avg" --argjson op "$overall_peak" '
+    {
+      per_fan: ( .per_fan | to_entries
+        | map({key:.key, value:{
+            avg_90d: ([.value[].rpm] | if length==0 then 0 else (add/length) end),
+            peak_90d: ([.value[].rpm] | (max // 0))
+          }})
+        | from_entries),
+      overall: {avg_rpm_90d:$oa, peak_avg_rpm_90d:$op}
+    }'
+}
+
 ITEM_NAME=(
   ""
   "1 PSU" "2 Disks/RAID/SMART" "3 Memory/ECC" "4 CPU" "5 NIC"
@@ -1528,6 +1706,9 @@ check_disks() {
     : "${NVME_MEDIA_ERR_WARN:=1}"
     : "${NVME_PCT_USED_WARN:=80}"
 
+    local SMART_REQUIRED_EFFECTIVE="$SMART_REQUIRED"
+    local NVME_REQUIRED_EFFECTIVE="$NVME_REQUIRED"
+
     local tips_text="$(get_item_tips 2)"
 
     local disk_dir="$LOG_DIR/disks"
@@ -1600,6 +1781,7 @@ check_disks() {
     local -a nvme_cw_list=()
     local -a nvme_media_err_list=()
     local -a nvme_pct80_list=()
+    local nvme_device_count=0
     local nvme_temp_max=""
     local -a warn_reasons=()
     local -a fail_reasons=()
@@ -1619,6 +1801,21 @@ check_disks() {
     local smartctl_state="missing"
     local nvme_state="missing"
     local lsblk_state="missing"
+
+    local smart_required_effective_flag=0
+    smart_required_effective_flag=$smart_required_flag
+    local nvme_required_effective_flag=0
+    nvme_required_effective_flag=$nvme_required_flag
+
+    local megaraid_present=0
+    local smart_virtual_devices_count=0
+    local smart_passthrough_count=0
+    local smart_virtual_failed_count=0
+    local smart_virtual_note_needed=0
+    local smart_virtual_only=0
+    local smart_virtual_detected=0
+    local smart_passthrough_detected=0
+    local nvme_skipped=0
 
     local storcli_available=0
     local storcli_cmd="${RAID_STORCLI_CMD:-$STORCLI_BIN}"
@@ -1702,6 +1899,7 @@ check_disks() {
                 storcli_state="ok"
                 storcli_summary_path="${disk_dir}/storcli_summary_${TIMESTAMP}.json"
                 printf '%s\n' "$raid_summary_raw" > "$storcli_summary_path"
+                megaraid_present=1
                 vd_total=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_total // 0)' 2>/dev/null)
                 [[ -z "$vd_total" ]] && vd_total=0
                 vd_degraded=$(echo "$raid_summary_raw" | jq -r '(.agg.vd_degraded // 0)' 2>/dev/null)
@@ -1903,6 +2101,37 @@ check_disks() {
             [[ "$reallocated" =~ ^-?[0-9]+$ ]] || reallocated=0
             [[ "$pending" =~ ^-?[0-9]+$ ]] || pending=0
             [[ "$uncorrect" =~ ^-?[0-9]+$ ]] || uncorrect=0
+            local virtual_under_raid=0
+            local dev_type_lower="${dev_type,,}"
+            if [[ "$dev_type_lower" == megaraid* ]]; then
+                virtual_under_raid=1
+            else
+                local model_upper
+                model_upper=$(echo "$model" | tr '[:lower:]' '[:upper:]')
+                if [[ "$model_upper" =~ ^BROADCOM[[:space:]]+MR ]]; then
+                    virtual_under_raid=1
+                elif [[ "$model_upper" =~ ^LSI.*MEGARAID ]]; then
+                    virtual_under_raid=1
+                elif [[ "$model_upper" =~ ^AVAGO.*MEGARAID ]]; then
+                    virtual_under_raid=1
+                elif echo "$smart_json" | grep -qi 'megaraid'; then
+                    virtual_under_raid=1
+                fi
+            fi
+            if (( virtual_under_raid )); then
+                megaraid_present=1
+                smart_virtual_detected=1
+                ((smart_virtual_devices_count++))
+            else
+                smart_passthrough_detected=1
+                ((smart_passthrough_count++))
+            fi
+
+            local virtual_flag="false"
+            if (( virtual_under_raid )); then
+                virtual_flag="true"
+            fi
+
             smart_devices_entries+=("$(jq -n \
                 --arg dev "$disk" \
                 --arg model "$model" \
@@ -1912,18 +2141,27 @@ check_disks() {
                 --argjson uncorr "${uncorrect:-0}" \
                 --argjson temp "$temperature_json" \
                 --argjson poh "$poh_json" \
-                '{dev:$dev, model:$model, status:$status, realloc:$realloc, pending:$pending, uncorrect:$uncorr, temp:(if $temp==null then null else $temp end), poh:(if $poh==null then null else $poh end)}')")
-            if [[ "$overall" != "PASSED" ]]; then
-                smart_failed_list+=("$disk")
-            fi
-            if (( ${reallocated:-0} > 0 )); then
-                smart_realloc_list+=("$disk")
-            fi
-            if (( ${pending:-0} > 0 )); then
-                smart_pending_list+=("$disk")
-            fi
-            if (( ${uncorrect:-0} > 0 )); then
-                smart_uncorr_list+=("$disk")
+                --arg virtual "$virtual_flag" \
+                '{dev:$dev, model:$model, status:$status, realloc:$realloc, pending:$pending, uncorrect:$uncorr, temp:(if $temp==null then null else $temp end), poh:(if $poh==null then null else $poh end)}
+                 + (if $virtual=="true" then {virtual_under_raid:true} else {} end)')")
+
+            if (( virtual_under_raid )); then
+                if [[ "$overall" != "PASSED" ]]; then
+                    ((smart_virtual_failed_count++))
+                fi
+            else
+                if [[ "$overall" != "PASSED" ]]; then
+                    smart_failed_list+=("$disk")
+                fi
+                if (( ${reallocated:-0} > 0 )); then
+                    smart_realloc_list+=("$disk")
+                fi
+                if (( ${pending:-0} > 0 )); then
+                    smart_pending_list+=("$disk")
+                fi
+                if (( ${uncorrect:-0} > 0 )); then
+                    smart_uncorr_list+=("$disk")
+                fi
             fi
         done
         if [[ "$smartctl_state" == "available" ]]; then
@@ -2036,6 +2274,17 @@ check_disks() {
     if (( ${#smart_devices_entries[@]} > 0 )); then
         smart_devices_json=$(printf '%s\n' "${smart_devices_entries[@]}" | jq -s '.')
     fi
+    if (( smart_virtual_detected )) && (( smart_passthrough_detected == 0 )); then
+        smart_virtual_only=1
+    fi
+    if (( megaraid_present )) && (( smart_passthrough_detected == 0 )) && (( smart_virtual_detected )); then
+        smart_required_effective_flag=0
+        SMART_REQUIRED_EFFECTIVE="false"
+        smart_virtual_note_needed=1
+    fi
+    if (( megaraid_present )) && (( smart_virtual_failed_count > 0 )); then
+        smart_virtual_note_needed=1
+    fi
     local smart_failed_json='[]'
     if (( ${#smart_failed_list[@]} > 0 )); then
         smart_failed_json=$(printf '%s\n' "${smart_failed_list[@]}" | jq -R . | jq -s '.')
@@ -2118,6 +2367,18 @@ check_disks() {
       '{devices:$devices, alerts:$alerts}')
     printf '%s\n' "$nvme_scan_file_json" > "$nvme_json_path"
 
+    if [[ -s "$nvme_json_path" ]]; then
+        nvme_device_count=$(jq -r '.devices | length' "$nvme_json_path" 2>/dev/null || echo 0)
+    fi
+    if [[ -z "$nvme_device_count" || "$nvme_device_count" == "null" ]]; then
+        nvme_device_count=0
+    fi
+    if (( nvme_device_count == 0 )); then
+        nvme_required_effective_flag=0
+        NVME_REQUIRED_EFFECTIVE="false"
+        nvme_skipped=1
+    fi
+
     if (( smartctl_available == 0 )); then
         tips_text+=$'\n安裝 smartmontools: apt install smartmontools'
     fi
@@ -2138,8 +2399,23 @@ check_disks() {
     : "${nvme_scanned_json:=false}"
     local smart_metrics_json
     smart_metrics_json=$(jq -n --argjson scanned $smart_scanned_json --argjson devices "$smart_devices_json" --argjson failed "$smart_failed_json" --argjson realloc "$smart_realloc_json" --argjson pending "$smart_pending_json" --argjson uncorr "$smart_uncorr_json" '{scanned:$scanned, devices:$devices, alerts:{failed:$failed, realloc_gt0:$realloc, pending_gt0:$pending, uncorr_gt0:$uncorr}}')
+    local nvme_skipped_flag="false"
+    if (( nvme_skipped )); then
+        nvme_skipped_flag="true"
+    fi
     local nvme_metrics_json
-    nvme_metrics_json=$(jq -n --argjson scanned $nvme_scanned_json --argjson devices "$nvme_devices_json" --argjson cw "$nvme_cw_json" --argjson media "$nvme_media_err_json" --argjson pct "$nvme_pct80_json" '{scanned:$scanned, devices:$devices, alerts:{crit_warn_gt0:$cw, media_err_gt0:$media, pct_used_ge80:$pct}}')
+    nvme_metrics_json=$(jq -n \
+      --argjson scanned $nvme_scanned_json \
+      --argjson devices "$nvme_devices_json" \
+      --argjson cw "$nvme_cw_json" \
+      --argjson media "$nvme_media_err_json" \
+      --argjson pct "$nvme_pct80_json" \
+      --arg skipped "$nvme_skipped_flag" \
+      '{
+         scanned:$scanned,
+         devices:$devices,
+         alerts:{crit_warn_gt0:$cw, media_err_gt0:$media, pct_used_ge80:$pct}
+       } + (if $skipped=="true" then {skipped:true} else {} end)')
     : "${raid_metrics_json:={}}"
     : "${smart_metrics_json:={}}"
     : "${nvme_metrics_json:={}}"
@@ -2317,10 +2593,15 @@ check_disks() {
 
     local raid_controller_count
     raid_controller_count=$(echo "$raid_controllers_json" | jq 'length' 2>/dev/null || echo 0)
-    local smart_device_count
-    smart_device_count=$(echo "$smart_devices_json" | jq 'length' 2>/dev/null || echo 0)
-    local nvme_device_count
-    nvme_device_count=$(echo "$nvme_devices_json" | jq 'length' 2>/dev/null || echo 0)
+    local smart_device_count_total
+    smart_device_count_total=$(echo "$smart_devices_json" | jq 'length' 2>/dev/null || echo 0)
+    local smart_device_count=$smart_passthrough_count
+    if [[ -z "$smart_device_count_total" || "$smart_device_count_total" == "null" ]]; then
+        smart_device_count_total=0
+    fi
+    if [[ -z "$nvme_device_count" || "$nvme_device_count" == "null" ]]; then
+        nvme_device_count=$(echo "$nvme_devices_json" | jq 'length' 2>/dev/null || echo 0)
+    fi
 
     local has_raid_data=0
     if (( storcli_scanned )) && (( raid_controller_count > 0 )); then
@@ -2361,8 +2642,17 @@ check_disks() {
 
     local smart_summary_brief=""
     if (( smart_scanned )); then
-        smart_summary_brief=$(printf "SMART disks=%s failed=%s realloc=%s pending=%s uncorr=%s" \
-            "$smart_device_count" "$smart_failed_count" "$smart_realloc_count" "$smart_pending_count" "$smart_uncorr_count")
+        if (( smart_device_count > 0 )); then
+            smart_summary_brief=$(printf "SMART disks=%s failed=%s realloc=%s pending=%s uncorr=%s" \
+                "$smart_device_count" "$smart_failed_count" "$smart_realloc_count" "$smart_pending_count" "$smart_uncorr_count")
+            if (( smart_virtual_devices_count > 0 )); then
+                smart_summary_brief=$(printf "%s virtual_ignored=%s" "$smart_summary_brief" "$smart_virtual_devices_count")
+            fi
+        elif (( smart_virtual_devices_count > 0 )); then
+            smart_summary_brief=$(printf "SMART virtual_only=%s (ignored)" "$smart_virtual_devices_count")
+        else
+            smart_summary_brief="SMART disks=0"
+        fi
     else
         smart_summary_brief=$(printf "SMART skipped (%s)" "${smart_reason:-not_run}")
     fi
@@ -2416,9 +2706,40 @@ check_disks() {
             raid_status_summary="None"
         fi
     fi
-    local disk_health_summary=$(printf "RAID: %s; SMART: ok=%s/%s fail=%s; NVMe: ok=%s/%s media_err=%s crit_warn=%s pct80=%s" \
-        "$raid_status_summary" "$smart_ok_count" "$smart_device_count" "$smart_failed_count" \
-        "$nvme_ok_count" "$nvme_device_count" "$nvme_media_err_count" "$nvme_cw_count" "$nvme_pct80_count")
+    local raid_summary_txt
+    raid_summary_txt=$(printf "RAID: %s" "$raid_status_summary")
+
+    local smart_summary_txt=""
+    if (( smart_scanned )); then
+        if (( smart_device_count > 0 )); then
+            smart_summary_txt=$(printf "SMART: ok=%s/%s fail=%s" "$smart_ok_count" "$smart_device_count" "$smart_failed_count")
+            if (( smart_virtual_devices_count > 0 )); then
+                smart_summary_txt+=" (virtual entries ignored)"
+            fi
+        elif (( smart_virtual_devices_count > 0 )); then
+            smart_summary_txt="SMART: ignored (RAID virtual dev)"
+        else
+            smart_summary_txt="SMART: none"
+        fi
+    else
+        smart_summary_txt=$(printf "SMART: skipped (%s)" "${smart_reason:-not_run}")
+    fi
+
+    local nvme_summary_txt=""
+    if (( nvme_skipped )); then
+        nvme_summary_txt="NVMe: none, skipped"
+    elif (( nvme_scanned )); then
+        nvme_summary_txt=$(printf "NVMe: ok=%s/%s media_err=%s crit_warn=%s pct80=%s" \
+            "$nvme_ok_count" "$nvme_device_count" "$nvme_media_err_count" "$nvme_cw_count" "$nvme_pct80_count")
+        if [[ -n "$nvme_temp_max" ]]; then
+            nvme_summary_txt=$(printf "%s max_temp=%s°C" "$nvme_summary_txt" "$nvme_temp_max")
+        fi
+    else
+        nvme_summary_txt=$(printf "NVMe: skipped (%s)" "${nvme_reason:-not_run}")
+    fi
+
+    local disk_health_summary
+    disk_health_summary=$(printf "%s; %s; %s" "$raid_summary_txt" "$smart_summary_txt" "$nvme_summary_txt")
 
     local smart_alert_total=$((smart_failed_count + smart_realloc_count + smart_pending_count + smart_uncorr_count))
     local reason_core
@@ -2436,6 +2757,13 @@ check_disks() {
             final_reason+="；${disk_health_summary}"
         else
             final_reason="$disk_health_summary"
+        fi
+    fi
+    if (( smart_virtual_note_needed )); then
+        if [[ -n "$final_reason" ]]; then
+            final_reason+="；SMART via RAID virtual device not authoritative; using RAID health as source of truth"
+        else
+            final_reason="SMART via RAID virtual device not authoritative; using RAID health as source of truth"
         fi
     fi
     if (( ${#missing_tools[@]} > 0 )); then
@@ -2470,13 +2798,29 @@ check_disks() {
     checks_entries+=("$(jq -n --arg vd_rb "$vd_rebuild" '{name:"RAID rebuild=0", ok:(($vd_rb|tonumber)==0), value:("rebuild="+$vd_rb)}')")
     checks_entries+=("$(jq -n --arg pd_fail "$pd_failed" --arg pd_miss "$pd_missing" '{name:"RAID PD healthy", ok:((($pd_fail|tonumber)==0) and (($pd_miss|tonumber)==0)), value:("pd_failed="+$pd_fail+", pd_missing="+$pd_miss)}')")
     checks_entries+=("$(jq -n --arg md_issues "$mdadm_issue_count" '{name:"mdadm arrays healthy", ok:(($md_issues|tonumber)==0), value:("issues="+$md_issues)}')")
-    checks_entries+=("$(jq -n --arg smart_fail "$smart_failed_count" '{name:"SMART FAILED=0", ok:(($smart_fail|tonumber)==0), value:("failed="+$smart_fail)}')")
-    checks_entries+=("$(jq -n --arg smart_realloc "$smart_realloc_count" '{name:"SMART realloc=0", ok:(($smart_realloc|tonumber)==0), value:("realloc="+$smart_realloc)}')")
-    checks_entries+=("$(jq -n --arg smart_pending "$smart_pending_count" '{name:"SMART pending=0", ok:(($smart_pending|tonumber)==0), value:("pending="+$smart_pending)}')")
-    checks_entries+=("$(jq -n --arg smart_uncorr "$smart_uncorr_count" '{name:"SMART uncorrect=0", ok:(($smart_uncorr|tonumber)==0), value:("uncorr="+$smart_uncorr)}')")
-    checks_entries+=("$(jq -n --arg nvme_cw "$nvme_cw_count" '{name:"NVMe crit_warn=0", ok:(($nvme_cw|tonumber)==0), value:("crit_warn="+$nvme_cw)}')")
-    checks_entries+=("$(jq -n --arg nvme_media "$nvme_media_err_count" '{name:"NVMe media_err=0", ok:(($nvme_media|tonumber)==0), value:("media_err="+$nvme_media)}')")
-    checks_entries+=("$(jq -n --arg nvme_pct "$nvme_pct80_count" '{name:"NVMe pct_used<80", ok:(($nvme_pct|tonumber)==0), value:("pct_used>=80_count="+$nvme_pct)}')")
+    if (( smart_required_effective_flag )); then
+        checks_entries+=("$(jq -n --arg smart_fail "$smart_failed_count" '{name:"SMART FAILED=0", ok:(($smart_fail|tonumber)==0), value:("failed="+$smart_fail)}')")
+        checks_entries+=("$(jq -n --arg smart_realloc "$smart_realloc_count" '{name:"SMART realloc=0", ok:(($smart_realloc|tonumber)==0), value:("realloc="+$smart_realloc)}')")
+        checks_entries+=("$(jq -n --arg smart_pending "$smart_pending_count" '{name:"SMART pending=0", ok:(($smart_pending|tonumber)==0), value:("pending="+$smart_pending)}')")
+        checks_entries+=("$(jq -n --arg smart_uncorr "$smart_uncorr_count" '{name:"SMART uncorrect=0", ok:(($smart_uncorr|tonumber)==0), value:("uncorr="+$smart_uncorr)}')")
+    else
+        local smart_skip_msg="skipped"
+        if (( smart_virtual_devices_count > 0 )); then
+            smart_skip_msg="skipped (RAID virtual dev)"
+        fi
+        checks_entries+=("$(jq -n --arg msg "$smart_skip_msg" '{name:"SMART required", ok:true, value:$msg}')")
+    fi
+    if (( nvme_required_effective_flag )); then
+        checks_entries+=("$(jq -n --arg nvme_cw "$nvme_cw_count" '{name:"NVMe crit_warn=0", ok:(($nvme_cw|tonumber)==0), value:("crit_warn="+$nvme_cw)}')")
+        checks_entries+=("$(jq -n --arg nvme_media "$nvme_media_err_count" '{name:"NVMe media_err=0", ok:(($nvme_media|tonumber)==0), value:("media_err="+$nvme_media)}')")
+        checks_entries+=("$(jq -n --arg nvme_pct "$nvme_pct80_count" '{name:"NVMe pct_used<80", ok:(($nvme_pct|tonumber)==0), value:("pct_used>=80_count="+$nvme_pct)}')")
+    else
+        local nvme_skip_msg="skipped"
+        if (( nvme_skipped )); then
+            nvme_skip_msg="skipped (no devices)"
+        fi
+        checks_entries+=("$(jq -n --arg msg "$nvme_skip_msg" '{name:"NVMe required", ok:true, value:$msg}')")
+    fi
     checks_entries+=("$(jq -n --arg summary "$disk_health_summary" '{name:"Disk health summary", ok:true, value:$summary}')")
     local checks_json='[]'
     if (( ${#checks_entries[@]} > 0 )); then
@@ -2485,8 +2829,8 @@ check_disks() {
 
     local th_json
     th_json=$(jq -n \
-      --arg smart_req "$SMART_REQUIRED" \
-      --arg nvme_req "$NVME_REQUIRED" \
+      --arg smart_req "$SMART_REQUIRED_EFFECTIVE" \
+      --arg nvme_req "$NVME_REQUIRED_EFFECTIVE" \
       --arg root_req "$ROOT_REQUIRED" \
       --arg disk_rebuild "$DISK_REBUILD_WARN" \
       --arg pd_fail "$PD_FAIL_CRIT" \
@@ -2785,71 +3129,56 @@ check_cpu() {
         echo "[INFO] CPU baseline created/updated: ${baseline_avg}°C"
     fi
 
-    # --- Historical Analysis (using LOG_DAYS) ---
-    local history_days="$LOG_DAYS"
-    local historical_files
-    mapfile -t historical_files < <(find "$metrics_dir" -name "metrics_*.json" -mtime -"$history_days" 2>/dev/null)
-    
-    local peak_max_temp="null"
-    local rolling_avg_temp="null"
-    if [[ ${#historical_files[@]} -gt 0 ]]; then
-        local stats
-        stats=$(jq -s '
-            {
-                peak: (map(.metrics.max // null) | max),
-                avg_sum: ([.[] | .metrics.average // 0] | add),
-                avg_count: ([.[] | .metrics.average // null] | length)
-            }
-        ' "${historical_files[@]}")
-        
-        peak_max_temp=$(echo "$stats" | jq -r '.peak')
-        local avg_sum
-        avg_sum=$(echo "$stats" | jq -r '.avg_sum')
-        local avg_count
-        avg_count=$(echo "$stats" | jq -r '.avg_count')
-
-        if (( avg_count > 0 )); then
-            rolling_avg_temp=$(awk -v sum="$avg_sum" -v count="$avg_count" 'BEGIN {printf "%.1f", sum/count}')
-        fi
-    fi
-    [[ "$peak_max_temp" == "null" ]] && peak_max_temp=$max_temp
-    local peak_display
-    peak_display=$(awk -v v="$peak_max_temp" 'BEGIN { printf "%.1f", v }')
+    local cur_max_temp="$max_temp"
+    local cpu_hist_file="${LOG_DIR}/cpu/cpu_history.json"
+    local iso_now; iso_now=$(date -u +"%Y-%m-%d %H:%M:%S")
+    local peak_ma
+    peak_ma=$(cpu_history_upsert_and_stats "$cur_max_temp" "$avg_temp" "$SCRIPT_START_TS" "$iso_now" "$cpu_hist_file")
+    local cpu90_peak="${peak_ma%%|*}"
+    local cpu90_ma="${peak_ma##*|}"
+    [[ -z "$cpu90_peak" ]] && cpu90_peak="0"
+    [[ -z "$cpu90_ma" ]] && cpu90_ma="0"
+    local cpu90_peak_display cpu90_ma_display
+    cpu90_peak_display=$(awk -v v="$cpu90_peak" 'BEGIN { printf "%.1f", v }')
+    cpu90_ma_display=$(awk -v v="$cpu90_ma" 'BEGIN { printf "%.1f", v }')
 
     # Logic
     local status="PASS"
-    local reason=""
+    local cpu_reason=""
     local temp_diff
     temp_diff=$(awk -v avg="$avg_temp" -v base="$baseline_avg" 'BEGIN { printf "%.4f", avg-base }')
 
     if float_ge "$max_temp" "$CPU_TEMP_CRIT"; then
         status="FAIL"
-        reason="CPU 溫度嚴重過高. Max: ${max_temp_display}°C (閾值: ${CPU_TEMP_CRIT}°C). ${history_days}d Peak: ${peak_display}°C."
+        cpu_reason=$(printf "CPU 溫度嚴重過高。Max: %s°C ≥ %s°C。90d Peak: %s°C, 90d MA: %s°C." "$max_temp_display" "$CPU_TEMP_CRIT" "$cpu90_peak_display" "$cpu90_ma_display")
     elif float_ge "$max_temp" "$CPU_TEMP_WARN"; then
         status="WARN"
-        reason="CPU 溫度警告. Max: ${max_temp_display}°C (閾值: ${CPU_TEMP_WARN}°C). ${history_days}d Peak: ${peak_display}°C."
+        cpu_reason=$(printf "CPU 溫度警告。Max: %s°C ≥ WARN %s°C。90d Peak: %s°C, 90d MA: %s°C." "$max_temp_display" "$CPU_TEMP_WARN" "$cpu90_peak_display" "$cpu90_ma_display")
     elif float_ge "$temp_diff" 15; then
         status="FAIL"
-        reason="CPU 平均溫度 (${avg_temp_display}°C) 相比基準 (${baseline_avg}°C) 異常升高 ${temp_diff}°C."
+        cpu_reason=$(printf "CPU 平均溫度異常升高：%s°C 較基準 %s°C 高出 %s°C。90d MA: %s°C, 90d Peak: %s°C." "$avg_temp_display" "$baseline_avg" "$temp_diff" "$cpu90_ma_display" "$cpu90_peak_display")
     elif float_ge "$temp_diff" 10; then
         status="WARN"
-        reason="CPU 平均溫度 (${avg_temp_display}°C) 相比基準 (${baseline_avg}°C) 升高 ${temp_diff}°C."
+        cpu_reason=$(printf "CPU 平均溫度升高：%s°C 較基準 %s°C 高出 %s°C。90d MA: %s°C, 90d Peak: %s°C." "$avg_temp_display" "$baseline_avg" "$temp_diff" "$cpu90_ma_display" "$cpu90_peak_display")
     else
-        reason="CPU 溫度正常. Max: ${max_temp_display}°C (${history_days}d Peak: ${peak_display}°C), Avg: ${avg_temp_display}°C."
+        cpu_reason=$(printf "CPU 溫度正常。Max: %s°C (90d Peak: %s°C), Avg: %s°C (90d MA: %s°C)." "$max_temp_display" "$cpu90_peak_display" "$avg_temp_display" "$cpu90_ma_display")
     fi
 
     # Final JSON
     local metrics_json
-    metrics_json=$(jq -n --argjson max "$max_temp" --argjson avg "$avg_temp" \
-        '{max: $max, average: $avg}')
+    metrics_json=$(jq -n \
+        --argjson max "$max_temp" \
+        --argjson avg "$avg_temp" \
+        --arg peak "$cpu90_peak" \
+        --arg ma "$cpu90_ma" \
+        '{max: $max, average: $avg, historical_stats:{peak_max_temp_90d:($peak|tonumber), rolling_avg_temp_90d:($ma|tonumber)}}')
     
     local thresholds_json
     thresholds_json=$(jq -n --argjson warn "$CPU_TEMP_WARN" --argjson crit "$CPU_TEMP_CRIT" --argjson base "$baseline_avg" \
         '{warn_celsius:$warn, crit_celsius:$crit, baseline_avg_celsius:$base}')
 
     local historical_stats_json
-    historical_stats_json=$(jq -n --argjson peak "$peak_max_temp" --argjson roll_avg "$rolling_avg_temp" --argjson days "$history_days" \
-        "{\"peak_max_temp_\(\$days)d\": \$peak, \"rolling_avg_temp_\(\$days)d\": \$roll_avg, \"days\": \$days}")
+    historical_stats_json=$(echo "$metrics_json" | jq '.historical_stats // {}')
 
     local evidence_json
     evidence_json=$(jq -n --arg raw "$raw_log_path" --arg base "$baseline_path" \
@@ -2859,7 +3188,7 @@ check_cpu() {
     final_json=$(jq -n \
         --arg status "$status" \
         --arg item "$item" \
-        --arg reason "$reason" \
+        --arg reason "$cpu_reason" \
         --argjson metrics "$metrics_json" \
         --argjson thresholds "$thresholds_json" \
         --argjson history "$historical_stats_json" \
@@ -2875,14 +3204,14 @@ check_cpu() {
     checks_json=$(jq -n \
       --arg max_temp "$max_temp" \
       --arg max_display "$max_temp_display" \
-      --arg avg_temp "$avg_temp_display" \
-      --arg peak "$peak_display" \
+      --arg peak "$cpu90_peak_display" \
+      --arg ma "$cpu90_ma_display" \
       --arg warn "$CPU_TEMP_WARN" \
       --arg crit "$CPU_TEMP_CRIT" \
       '[
          {"name":"Max Temp <= WARN","ok":((($max_temp|tonumber) <= ($warn|tonumber))),"value":("max="+$max_display+"°C")},
          {"name":"Max Temp <= CRIT","ok":((($max_temp|tonumber) <= ($crit|tonumber))),"value":("max="+$max_display+"°C")},
-         {"name":"Rolling Avg (90d)","ok":true,"value":("avg="+$avg_temp+"°C")},
+         {"name":"Rolling Avg (90d)","ok":true,"value":("avg="+$ma+"°C")},
          {"name":"90d Peak","ok":true,"value":("peak="+$peak+"°C")}
        ]')
 
@@ -3395,11 +3724,56 @@ check_fans() {
     echo "$fan_out"
 
     # Get IPMI-level SDR data
+    local -a ipmi_fan_data=()
     local ipmi_sdr_out=""
     if (( ! SKIP_BMC )); then
         ipmi_sdr_out=$(ipmi_try sdr elist | grep -i fan)
         echo "$ipmi_sdr_out" > "$raw_ipmi_sdr_log"
         echo "$ipmi_sdr_out"
+
+        local ipmi_parse_source=""
+        if [[ -s "$raw_ipmi_sdr_log" ]]; then
+            ipmi_parse_source="$raw_ipmi_sdr_log"
+        elif [[ -n "$ipmi_sdr_out" ]]; then
+            ipmi_parse_source="INLINE"
+        fi
+
+        if [[ -n "$ipmi_parse_source" ]]; then
+            local __ipmi_line
+            if [[ "$ipmi_parse_source" == "INLINE" ]]; then
+                while IFS= read -r __ipmi_line; do
+                    [[ -z "$__ipmi_line" ]] && continue
+                    __ipmi_line=${__ipmi_line%$'\r'}
+                    local trimmed_line
+                    trimmed_line=$(printf '%s' "$__ipmi_line" | sed 's/^[[:space:]]*//')
+                    [[ "$trimmed_line" =~ ^[Ff][Aa][Nn]_ ]] || continue
+                    [[ "$trimmed_line" =~ RPM ]] || continue
+                    local fan_name
+                    fan_name=$(printf '%s\n' "$__ipmi_line" | cut -d'|' -f1 | xargs | tr ' ' '_' | tr -d '-')
+                    [[ -z "$fan_name" ]] && continue
+                    local current_rpm
+                    current_rpm=$(printf '%s\n' "$__ipmi_line" | cut -d'|' -f5 | grep -oE '[0-9]+' | head -n 1)
+                    [[ -z "$current_rpm" ]] && continue
+                    ipmi_fan_data+=("${fan_name}|${current_rpm}")
+                done <<< "$ipmi_sdr_out"
+            else
+                while IFS= read -r __ipmi_line; do
+                    [[ -z "$__ipmi_line" ]] && continue
+                    __ipmi_line=${__ipmi_line%$'\r'}
+                    local trimmed_line
+                    trimmed_line=$(printf '%s' "$__ipmi_line" | sed 's/^[[:space:]]*//')
+                    [[ "$trimmed_line" =~ ^[Ff][Aa][Nn]_ ]] || continue
+                    [[ "$trimmed_line" =~ RPM ]] || continue
+                    local fan_name
+                    fan_name=$(printf '%s\n' "$__ipmi_line" | cut -d'|' -f1 | xargs | tr ' ' '_' | tr -d '-')
+                    [[ -z "$fan_name" ]] && continue
+                    local current_rpm
+                    current_rpm=$(printf '%s\n' "$__ipmi_line" | cut -d'|' -f5 | grep -oE '[0-9]+' | head -n 1)
+                    [[ -z "$current_rpm" ]] && continue
+                    ipmi_fan_data+=("${fan_name}|${current_rpm}")
+                done < "$ipmi_parse_source"
+            fi
+        fi
     fi
 
     # If no data from either source, exit with INFO and evidence
@@ -3436,17 +3810,32 @@ check_fans() {
     baseline_dir=$(dirname "$baseline_path")
     mkdir -p "$baseline_dir" 2>/dev/null || true
 
-    local current_fans_json
-    current_fans_json=$(printf '%s\n' "${current_fans[@]}" | jq -R 'select(length>0) | split("|") | {name:.[0], baseline_rpm:(.[1]|tonumber?)}' | jq -s '.')
-    [[ -z "$current_fans_json" ]] && current_fans_json='[]'
+    local -a baseline_seed_data=("${current_fans[@]}")
+    local baseline_seed_source="os"
+    if (( ${#baseline_seed_data[@]} == 0 )); then
+        if (( ${#ipmi_fan_data[@]} > 0 )); then
+            baseline_seed_source="ipmi"
+            baseline_seed_data=("${ipmi_fan_data[@]}")
+        else
+            baseline_seed_source="none"
+        fi
+    fi
+
+    local baseline_seed_json
+    baseline_seed_json=$(printf '%s\n' "${baseline_seed_data[@]}" | jq -R 'select(length>0) | split("|") | {name:.[0], baseline_rpm:(.[1]|tonumber?)}' | jq -s '.')
+    [[ -z "$baseline_seed_json" ]] && baseline_seed_json='[]'
 
     local baseline_initialized=0
     if [[ "$FAN_BASELINE_RESET" == "1" ]] || [[ ! -s "$baseline_path" ]]; then
         baseline_initialized=1
-        jq -n --argjson arr "$current_fans_json" \
+        jq -n --argjson arr "$baseline_seed_json" \
            '$arr as $a | {fans: ($a | map({name:.name, baseline_rpm:(.baseline_rpm // 0)}))}' \
            > "$baseline_path"
-        echo "[Info] fan baseline initialized: $baseline_path"
+        if [[ "$baseline_seed_source" != "none" ]]; then
+            echo "[Info] fan baseline initialized (source=${baseline_seed_source}): $baseline_path"
+        else
+            echo "[Info] fan baseline initialized: $baseline_path"
+        fi
     fi
 
     declare -A FAN_BASELINE=()
@@ -3458,6 +3847,13 @@ check_fans() {
             brpm=$(jq -r '.baseline_rpm // 0' <<<"$line")
             [[ -n "$name" ]] && FAN_BASELINE["$name"]="$brpm"
         done < <(jq -c '.fans[]?' "$baseline_path" 2>/dev/null || true)
+    fi
+
+    local sensors_fan_count="${#os_fan_data[@]}"
+    local ipmi_fan_count="${#ipmi_fan_data[@]}"
+    local ipmi_only=0
+    if (( sensors_fan_count == 0 && ipmi_fan_count > 0 )); then
+        ipmi_only=1
     fi
 
     local low_rpm_count=0
@@ -3585,7 +3981,119 @@ check_fans() {
     done
 
     # --- Process IPMI SDR data ---
-    if [[ -n "$ipmi_sdr_out" ]]; then
+    if (( ipmi_fan_count > 0 )); then
+        for entry in "${ipmi_fan_data[@]}"; do
+            IFS='|' read -r fan_name current_rpm <<< "$entry"
+            [[ -z "$fan_name" || -z "$current_rpm" ]] && continue
+
+            local base="${FAN_BASELINE["$fan_name"]:-0}"
+            local baseline_source="ipmi"
+            local base_disp="N/A"
+            local dev_disp="N/A"
+            local deviation_pct_signed=""
+            local deviation_pct_abs=""
+            local deviation_pct_abs_int=0
+
+            if (( ipmi_only )) && [[ "$base" =~ ^[0-9]+$ && "$base" -gt 0 && "$current_rpm" =~ ^[0-9]+$ ]]; then
+                base_disp="$base"
+                deviation_pct_signed=$(awk -v c="$current_rpm" -v b="$base" 'BEGIN { if (b>0) printf "%.1f", (c-b)*100.0/b }')
+                if [[ -n "$deviation_pct_signed" ]]; then
+                    baseline_values_present=1
+                    deviation_pct_abs=$(awk -v v="$deviation_pct_signed" 'BEGIN { if (v<0) v=-v; printf "%.1f", v }')
+                    deviation_pct_abs_int=$(awk -v v="$deviation_pct_abs" 'BEGIN { printf "%.0f", v }')
+                    local deviation_pct_int
+                    deviation_pct_int=$(awk -v v="$deviation_pct_signed" 'BEGIN { printf "%.0f", v }')
+                    dev_disp="${deviation_pct_int}%"
+                fi
+            fi
+
+            local fan_status="OK"
+            if (( current_rpm < 100 )); then
+                ((low_rpm_count++))
+                fan_status="CRIT (Stopped)"
+                reason_details+=("${fan_name}:${current_rpm}RPM")
+            elif (( ipmi_only )) && (( deviation_pct_abs_int > ${DEVIATION_CRIT_PCT:-0} )); then
+                ((deviation_crit_count++))
+                fan_status=$(printf 'CRIT (Dev >%s%%)' "$DEVIATION_CRIT_PCT")
+                if [[ -n "$deviation_pct_abs" ]]; then
+                    reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
+                else
+                    reason_details+=("${fan_name}:${current_rpm}RPM")
+                fi
+            elif (( current_rpm < FAN_RPM_TH )); then
+                ((low_rpm_count++))
+                fan_status="WARN (<${FAN_RPM_TH}RPM)"
+                reason_details+=("${fan_name}:${current_rpm}RPM")
+            elif (( ipmi_only )) && (( deviation_pct_abs_int > ${DEVIATION_WARN_PCT:-0} )); then
+                ((deviation_warn_count++))
+                fan_status=$(printf 'WARN (Dev >%s%%)' "$DEVIATION_WARN_PCT")
+                if [[ -n "$deviation_pct_abs" ]]; then
+                    reason_details+=("${fan_name}:${current_rpm}RPM,Dev:${deviation_pct_abs}%")
+                else
+                    reason_details+=("${fan_name}:${current_rpm}RPM")
+                fi
+            fi
+
+            fan_summary_array+=("${fan_name}|${current_rpm}|${FAN_RPM_TH}")
+            echo "DEBUG FAN: ${fan_name}|${current_rpm}|${FAN_RPM_TH}" >&2
+
+            metrics_json_array+=( $(jq -n \
+                --arg name "$fan_name" \
+                --arg status "$fan_status" \
+                --argjson rpm "$current_rpm" \
+                --arg bsrc "$baseline_source" \
+                --arg base_disp "$base_disp" \
+                --arg dev_disp "$dev_disp" \
+                '{
+                   name:$name,
+                   status:$status,
+                   current_rpm:$rpm,
+                   baseline_source:$bsrc
+                 }
+                 + (if $base_disp!="N/A" then {baseline_rpm: ($base_disp|tonumber)} else {} end)
+                 + (if $dev_disp!="N/A" then {deviation_pct: ($dev_disp|sub("%$";"")|tonumber)} else {} end)') )
+
+            local fan_ok="true"
+            [[ "$fan_status" == WARN* || "$fan_status" == CRIT* || "$fan_status" == FAIL* ]] && fan_ok="false"
+            if (( fan_checks_added < fan_checks_limit )); then
+                fan_checks_entries+=( "$(jq -n \
+                    --arg name "$fan_name" \
+                    --arg ok "$fan_ok" \
+                    --arg cur "$current_rpm" \
+                    --arg base "$base_disp" \
+                    --arg dev "$dev_disp" \
+                    '{name:$name, ok:($ok=="true"), value:("cur="+$cur+", base="+$base+", dev="+$dev)}')" )
+                fan_checks_added=$((fan_checks_added+1))
+            fi
+
+            local ipmi_eval_entry
+            ipmi_eval_entry=$(jq -n \
+                --arg name "$fan_name" \
+                --arg status "$fan_status" \
+                --arg bsrc "$baseline_source" \
+                --argjson rpm "$current_rpm" \
+                --arg base_disp "$base_disp" \
+                --arg dev_disp "$dev_disp" \
+                '{
+                   name:$name,
+                   status:$status,
+                   baseline_source:$bsrc,
+                   rpm:$rpm
+                 }
+                 + (if $base_disp!="N/A" then {baseline_rpm: ($base_disp|tonumber)} else {} end)
+                 + (if $dev_disp!="N/A" then {deviation_pct: ($dev_disp|sub("%$";"")|tonumber)} else {} end)')
+            fan_eval_entries+=("$ipmi_eval_entry")
+
+            if [[ -n "$deviation_pct_abs" ]]; then
+                if [[ -z "$worst_deviation_abs" ]] || [[ $(awk -v a="$deviation_pct_abs" -v b="$worst_deviation_abs" 'BEGIN{print (a>b)?1:0}') == 1 ]]; then
+                    worst_deviation_abs="$deviation_pct_abs"
+                    worst_deviation_signed="$deviation_pct_signed"
+                    worst_fan="$fan_name"
+                fi
+            fi
+        done
+    elif [[ -n "$ipmi_sdr_out" ]]; then
+        # Fallback: legacy parsing when Fan_* lines were not captured (maintains compatibility)
         while read -r line; do
             echo "$line" | grep -q "RPM" || continue
 
@@ -3655,6 +4163,12 @@ check_fans() {
     fan_eval_full_json=$(jq -n --argjson metrics "$fan_eval_entries_json" --argjson thresholds "$fan_eval_thresholds_json" \
       '{metrics:$metrics, thresholds:$thresholds}')
     printf '%s\n' "$fan_eval_full_json" > "$fan_eval_file"
+
+    local fan_hist_file="${LOG_DIR}/fan/fan_history.json"
+    local fan_iso_now; fan_iso_now=$(date -u +"%Y-%m-%d %H:%M:%S")
+    local fan_hist_stats
+    fan_hist_stats=$(fan_history_upsert_and_stats "$fan_eval_entries_json" "$SCRIPT_START_TS" "$fan_iso_now" "$fan_hist_file")
+    [[ -z "$fan_hist_stats" ]] && fan_hist_stats='{"overall":{"avg_rpm_90d":0,"peak_avg_rpm_90d":0},"per_fan":{}}'
 
     local final_status="PASS"
     local final_reason="所有風扇轉速正常"
@@ -3759,9 +4273,17 @@ check_fans() {
         fi
     fi
 
-    local metrics_json='[]'
+    local metrics_entries_json='[]'
     if (( ${#metrics_json_array[@]} > 0 )); then
-        metrics_json=$(printf '%s\n' "${metrics_json_array[@]}" | jq -s '.')
+        metrics_entries_json=$(printf '%s\n' "${metrics_json_array[@]}" | jq -s '.')
+    fi
+    local fan_metrics_json
+    fan_metrics_json=$(jq -n --argjson entries "$metrics_entries_json" '{entries:$entries}')
+    fan_metrics_json=$(echo "$fan_metrics_json" | jq --argjson hist "$fan_hist_stats" '. + {historical_stats: $hist.overall}')
+    local historical_stats_json
+    historical_stats_json=$(echo "$fan_hist_stats" | jq '.overall')
+    if [[ "$historical_stats_json" == "null" || -z "$historical_stats_json" ]]; then
+        historical_stats_json='{}'
     fi
 
     local thresholds_json
@@ -3785,10 +4307,11 @@ check_fans() {
         --arg status "$final_status" \
         --arg item "$item" \
         --arg reason "$final_reason" \
-        --argjson metrics "$metrics_json" \
+        --argjson metrics "$fan_metrics_json" \
         --argjson thresholds "$thresholds_json" \
         --argjson evidence "$evidence_json" \
-        '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, evidence:$evidence}')
+        --argjson history "$historical_stats_json" \
+        '{status:$status, item:$item, reason:$reason, metrics:$metrics, thresholds:$thresholds, historical_stats:$history, evidence:$evidence}')
 
     # --- Build judgement ---
     local th_json
@@ -4282,8 +4805,14 @@ check_bmc() {
 
   load_severity_map
 
-  local now_epoch=$(date +%s) cutoff=0
-  (( SEL_DAYS>0 )) && cutoff=$(( now_epoch - SEL_DAYS*86400 ))
+  local now_epoch sel_cutoff sel_days
+  now_epoch=$(date +%s)
+  sel_days="${SEL_DAYS:-0}"
+  sel_cutoff=0
+  if (( sel_days > 0 )); then
+    sel_cutoff=$(( now_epoch - sel_days*86400 ))
+  fi
+  local last_warncrit_epoch=""
 
   declare -A SENSOR_SUMMARY
   declare -a EVENTS_JSON
@@ -4300,13 +4829,6 @@ check_bmc() {
     done
     echo "$f6" | grep -iq 'Deasserted' && continue
     [[ -z "$f4" || -z "$f5" ]] && continue
-
-    if (( SEL_DAYS>0 )) && [[ "$f2" =~ ^[0-9]{2}[-/][0-9]{2}[-/][0-9]{4}$ ]]; then
-      evt_epoch=$(date -d "$(normalize_mmddyyyy "$f2") $f3" +%s 2>/dev/null || echo 0)
-      if (( evt_epoch>0 && evt_epoch<cutoff )); then
-        continue
-      fi
-    fi
 
     local sensor="$f4" event="$f5" event_l
     event_l=$(echo "$event" | tr '[:upper:]' '[:lower:]')
@@ -4332,11 +4854,35 @@ check_bmc() {
       ((SEL_NOISE_RAW++))
       (( SEL_NOISE_HIDE )) && continue || sev="INFO"
     fi
-    case "$sev" in
-      CRIT) ((SEL_CRIT++));;
-      WARN) ((SEL_WARN++));;
-      *)    ((SEL_INFO++));;
-    esac
+
+    local event_epoch=""
+    if [[ -n "$f2" || -n "$f3" ]]; then
+      event_epoch=$(printf '%s %s' "$f2" "$f3" | dt_to_epoch_or_empty 2>/dev/null || true)
+    fi
+    if [[ "$sev" == "CRIT" || "$sev" == "WARN" ]]; then
+      if [[ -n "$event_epoch" ]]; then
+        if [[ -z "$last_warncrit_epoch" || "$event_epoch" -gt "$last_warncrit_epoch" ]]; then
+          last_warncrit_epoch="$event_epoch"
+        fi
+      fi
+    fi
+
+    local countable=1
+    if (( sel_days > 0 )) && [[ -n "$event_epoch" ]]; then
+      if (( event_epoch < sel_cutoff )); then
+        countable=0
+      fi
+    fi
+
+    if (( countable )); then
+      case "$sev" in
+        CRIT) ((SEL_CRIT++));;
+        WARN) ((SEL_WARN++));;
+        *)    ((SEL_INFO++));;
+      esac
+    else
+      [[ "$sev" != "CRIT" && "$sev" != "WARN" ]] && ((SEL_INFO++))
+    fi
     [[ -n "$sensor" ]] && SENSOR_SUMMARY["$sensor"]=$(( ${SENSOR_SUMMARY["$sensor"]:-0} + 1 ))
 
     local dt_iso="$(echo "$f2" | sed 's/\//-/g')T${f3}"
@@ -4361,7 +4907,7 @@ check_bmc() {
     local cnt; cnt=$(echo "$line" | cut -d':' -f1)
     local name; name=$(echo "$line" | cut -d':' -f2-)
     local esc_name; esc_name=$(echo "$name" | jq -R . | sed 's/^"//;s/"$//')
-    SEL_TOP_ARRAY+=("{\"sensor\":\"$esc_name\",\"count\":$cnt}")
+      SEL_TOP_ARRAY+=("{\"sensor\":\"$esc_name\",\"count\":$cnt}")
   done < <(for k in "${!SENSOR_SUMMARY[@]}"; do echo "${SENSOR_SUMMARY[$k]}:$k"; done | sort -rn | head -n "$SEL_SHOW")
 
   echo "[SEL] CRIT=$SEL_CRIT WARN=$SEL_WARN INFO=$SEL_INFO (noise_hidden=$SEL_NOISE_HIDE noise_raw=$SEL_NOISE_RAW) (Top: $top_str)" >&2
@@ -4397,20 +4943,15 @@ check_bmc() {
     final_status="WARN"
   fi
 
-  local now_epoch last_cw_ts="" last_event_days="" days_since_display="N/A"
-  now_epoch=$SCRIPT_START_TS
-  local sel_regex
-  sel_regex=$(item_regex 12)
-  if [[ -n "$sel_regex" && -f "$SEL_DETAIL_FILE" ]]; then
-    last_cw_ts=$(last_event_epoch_in_sel "$SEL_DETAIL_FILE" "$now_epoch" "$SEL_DAYS" "$sel_regex")
-  fi
-  if [[ -n "$last_cw_ts" && "$last_cw_ts" != "0" ]]; then
-    local delta=$(( now_epoch - last_cw_ts ))
+  local days_since_display="N/A"
+  local last_event_days=""
+  if [[ -n "$last_warncrit_epoch" ]]; then
+    local delta=$(( (now_epoch - last_warncrit_epoch) / 86400 ))
     (( delta < 0 )) && delta=0
-    last_event_days=$(( (delta + 43200) / 86400 ))
-    days_since_display="$last_event_days"
-  elif (( SEL_DAYS > 0 )); then
-    days_since_display=">${SEL_DAYS}"
+    last_event_days="$delta"
+    days_since_display="$delta"
+  elif (( sel_days > 0 )); then
+    days_since_display=">${sel_days}"
   fi
 
   local days_clause_text=""
@@ -4660,12 +5201,12 @@ check_bmc() {
     --arg info "$SEL_INFO" \
     '{name:"SEL INFO 事件計數", ok:true, value:("info="+$info)}')" )
   sel_checks_entries+=( "$(jq -n \
-    --arg ds "${days_since_display:-}" \
-    --argjson rec "$RECOVER_DAYS" \
+    --arg ds "$days_since_display" \
+    --argjson rec "${RECOVER_DAYS:-30}" \
     'if ($ds|test("^[0-9]+$")) then
        {name:"Days since last CRIT/WARN", ok:(($ds|tonumber) >= rec), value:("days="+$ds+", RECOVER_DAYS="+(rec|tostring))}
      else
-       {name:"Days since last CRIT/WARN", ok:true, value:"none"}
+       {name:"Days since last CRIT/WARN", ok:false, value:"N/A"}
      end')" )
   sel_checks_entries+=( "$(jq -n \
     --arg recent "$recent_events_value" \
