@@ -818,14 +818,15 @@ set_status() {
       ;;
 
     11) # Cabling
-  local cab_days="${LOG_DAYS:-7}"
+      local cab_days="${LOG_DAYS:-7}"
+      [[ "$cab_days" =~ ^[0-9]+$ ]] || cab_days=7
       criteria="uplink link=yes, duplex=Full, speed>0, and no flaps within ${cab_days} 天"
       pass_rules="[\"所有 uplink link=yes 且 duplex=Full 且 speed>0\",\"最近 ${cab_days} 天內 flap_count=0\"]"
       warn_rules="[\"任一 uplink 連線狀態或速率異常\",\"最近 ${cab_days} 天內 flap_count>0\"]"
       fail_rules='[]'
       info_rules='["未提供 uplink 清單或缺少 ethtool/journalctl"]'
 
-      th_json=$(jq -n --argjson days "$cab_days" '{"LOG_DAYS":$days}')
+      th_json=$(jq -n --arg days "$cab_days" '{"LOG_DAYS":($days|tonumber)}')
 
       checks_json=$(jq -n \
         --arg status "$st" \
@@ -1234,21 +1235,27 @@ cabling_status_from_log(){
   local lf="$1"
   [[ -z "$lf" || ! -f "$lf" ]] && { echo "SKIP|Log file not found"; return; }
 
+  local log_days="${LOG_DAYS:-7}"
+  [[ "$log_days" =~ ^[0-9]+$ ]] || log_days=7
+
   local missing_tools=()
   grep -qi 'ethtool not found' "$lf" && missing_tools+=("ethtool")
   grep -qi 'journalctl not found' "$lf" && missing_tools+=("journalctl")
   local tools_state="ready"
+  local tools_missing=0
   if (( ${#missing_tools[@]} > 0 )); then
-    tools_state="missing: $(IFS=','; echo "${missing_tools[*]}")"
-    local reason="工具不足：${tools_state}"
-    echo "INFO|${reason}"
-    return
+    tools_missing=1
+    tools_state="missing: $(IFS='/'; echo "${missing_tools[*]}")"
   fi
 
-  local flaps; flaps=$(echo "$flaps" | awk '{s+=$1} END{print (s+0)}')
-  local lines; mapfile -t lines < <(parse_if_blocks "$lf")
+  local flaps=0
+  flaps=$(count_flaps "$lf" 2>/dev/null || echo 0)
+  [[ "$flaps" =~ ^[0-9]+$ ]] || flaps=0
+
+  local lines
+  mapfile -t lines < <(parse_if_blocks "$lf")
   if [[ ${#lines[@]} -eq 0 ]]; then
-    echo "INFO|No uplink interface data recorded in log"
+    echo "INFO|Uplinks: N/A; Flaps (last ${log_days}d): ${flaps} — No uplink interface data recorded in log"
     return
   fi
 
@@ -1284,18 +1291,8 @@ cabling_status_from_log(){
     summary_all+=("${iface}=${sp_show}/${dup_show}/${lnk_show}")
   done
 
-  if (( ${#uplist[@]} == 0 )); then
-    local summary_line
-    if (( ${#summary_all[@]} > 0 )); then
-      summary_line="Uplinks: $(IFS=', '; echo "${summary_all[*]}")"
-    else
-      summary_line="Uplinks: N/A"
-    fi
-    echo "INFO|${summary_line}; Flaps (last ${LOG_DAYS:-7}d): ${flaps} — 未設定 uplink 清單（--cable-uplink-ifaces）"
-    return
-  fi
-
-  local uplink_total=0 uplink_bad=0
+  local uplink_total=0
+  local uplink_bad=0
   local -a summary_parts=()
   for iface in "${uplist[@]}"; do
     [[ -z "$iface" ]] && continue
@@ -1303,6 +1300,7 @@ cabling_status_from_log(){
     sp="${IF_SPEED[$iface]:-}"
     dup="${IF_DUP[$iface]:-}"
     link="${IF_LINK[$iface]:-}"
+
     local sp_show
     if [[ -n "$sp" ]]; then
       sp_show="${sp}Mb/s"
@@ -1314,9 +1312,7 @@ cabling_status_from_log(){
     summary_parts+=("${iface}=${sp_show}/${dup_show}/${lnk_show}")
 
     local speed_ok=1
-    if [[ -z "$sp" || "$sp" == "0" ]]; then
-      speed_ok=0
-    fi
+    [[ -z "$sp" || "$sp" == "0" ]] && speed_ok=0
     local duplex_ok=1
     if [[ -z "$dup" || "${dup,,}" != "full" ]]; then
       duplex_ok=0
@@ -1330,32 +1326,40 @@ cabling_status_from_log(){
     fi
   done
 
-  if (( uplink_total == 0 )); then
-    echo "INFO|Uplink list provided but no matching interfaces found in log"
-    return
-  fi
-
-  local summary_line
+  local summary_line="Uplinks: N/A"
   if (( ${#summary_parts[@]} > 0 )); then
-    summary_line="Uplinks: $(IFS=', '; echo "${summary_parts[*]}")"
-  else
-    summary_line="Uplinks: N/A"
+    local IFS=','
+    summary_line="Uplinks: ${summary_parts[*]}"
+  elif (( ${#summary_all[@]} > 0 )); then
+    local IFS=','
+    summary_line="Uplinks: ${summary_all[*]}"
   fi
-  local flap_line="Flaps (last ${LOG_DAYS:-7}d): ${flaps}"
-  local cabling_reason=""
-  local status="INFO"
 
-  if (( uplink_bad == 0 && flaps == 0 )); then
-    status="PASS"
-    cabling_reason="Uplinks OK; no recent link flaps"
+  local flap_line="Flaps (last ${log_days}d): ${flaps}"
+  local status="INFO"
+  local cabling_reason=""
+
+  if (( uplink_total == 0 )); then
+    cabling_reason="no uplink list (--cable-uplink-ifaces)"
+  elif (( tools_missing )); then
+    cabling_reason="$tools_state"
   else
-    status="WARN"
-    if (( uplink_bad > 0 && flaps > 0 )); then
-      cabling_reason="Uplink has issues and flaps detected"
-    elif (( uplink_bad > 0 )); then
-      cabling_reason="Uplink has issues"
+    local has_flap_issue=0
+    if (( flaps > 0 )); then
+      has_flap_issue=1
+    fi
+    if (( uplink_bad == 0 && has_flap_issue == 0 )); then
+      status="PASS"
+      cabling_reason="Uplinks OK; no recent link flaps"
     else
-      cabling_reason="Flaps detected"
+      status="WARN"
+      if (( uplink_bad > 0 && has_flap_issue == 0 )); then
+        cabling_reason="Uplink issues detected"
+      elif (( uplink_bad == 0 && has_flap_issue == 1 )); then
+        cabling_reason="Link flaps detected"
+      else
+        cabling_reason="Uplink issues and flaps detected"
+      fi
     fi
   fi
 
@@ -4830,6 +4834,8 @@ check_cabling() {
   local have_ethtool=0 have_journalctl=0
   command -v ethtool >/dev/null 2>&1 && have_ethtool=1
   command -v journalctl >/dev/null 2>&1 && have_journalctl=1
+  local window_days="${LOG_DAYS:-7}"
+  [[ "$window_days" =~ ^[0-9]+$ ]] || window_days=7
 
   local uplink_str="${CABLE_UPLINK_IFACES:-}"
   local -a uplink_list=()
@@ -4877,11 +4883,11 @@ check_cabling() {
   local flap_count=0
   local flap_count_available=0
   if (( have_journalctl )); then
-    flap_count_available=1
-    flap_source=$(printf 'journalctl --since "%s days ago"' "${LOG_DAYS:-7}")
-    echo "[INFO] Checking journal for link flaps in the last ${LOG_DAYS:-7} days."
-    flap_output=$(journalctl --since "${LOG_DAYS:-7} days ago" 2>/dev/null | egrep -i 'link is (up|down)|carrier lost|resetting' || true)
+    flap_source=$(printf 'journalctl --since "%s days ago"' "$window_days")
+    echo "[INFO] Checking journal for link flaps in the last ${window_days} days."
+    flap_output=$(journalctl --since "${window_days} days ago" 2>/dev/null | egrep -i 'link is (up|down)|carrier lost|resetting' || true)
     if [[ -n "$flap_output" ]]; then
+      flap_count_available=1
       flap_count=$(printf '%s\n' "$flap_output" | grep -c .)
     fi
   else
@@ -4945,7 +4951,6 @@ check_cabling() {
     local IFS=','
     summary_line="Uplinks: ${summary_parts[*]}"
   fi
-  local window_days="${LOG_DAYS:-7}"
   local flap_display="N/A"
   if (( flap_count_available )); then
     flap_display="$flap_count"
@@ -5007,8 +5012,8 @@ check_cabling() {
     --argjson total "$uplink_total" \
     --argjson bad "$uplink_bad" \
     --arg tools "$tools_state" \
-    --argjson window "$cab_days" \
-    '{uplinks:$uplinks, flap_count:$flap, uplink_total:$total, uplink_bad:$bad, window_days:$window, tools:$tools}')
+    --arg days "$window_days" \
+    '{uplinks:$uplinks, flap_count:$flap, uplink_total:$total, uplink_bad:$bad, window_days:($days|tonumber), tools:$tools}')
 
   local flap_preview=""
   if [[ -n "$flap_output" ]]; then
@@ -5046,7 +5051,7 @@ check_cabling() {
     ]')
 
   local th_json
-  th_json=$(jq -n --argjson window "$window_days" '{"LOG_DAYS":$window}')
+  th_json=$(jq -n --arg days "$window_days" '{"LOG_DAYS":($days|tonumber)}')
 
   local criteria="uplink link=yes, duplex=Full, speed>0, and no flaps within ${window_days} 天"
   local jdg_json
