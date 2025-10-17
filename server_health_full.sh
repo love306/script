@@ -1327,8 +1327,8 @@ cabling_status_from_log(){
 
   local log_days="${LOG_DAYS:-7}"
   [[ "$log_days" =~ ^[0-9]+$ ]] || log_days=7
-  local flap_threshold="${CABLE_MAX_FLAPS:-0}"
-  [[ "$flap_threshold" =~ ^[0-9]+$ ]] || flap_threshold=0
+  local flap_threshold="${CABLE_MAX_FLAPS:-10}"
+  [[ "$flap_threshold" =~ ^[0-9]+$ ]] || flap_threshold=10
 
   local missing_tools=()
   grep -qi 'ethtool not found' "$lf" && missing_tools+=("ethtool")
@@ -4977,8 +4977,8 @@ check_cabling() {
   local flap_source=""
   local flap_count=0
   local flap_count_available=0
-  local flap_threshold="${CABLE_MAX_FLAPS:-0}"
-  [[ "$flap_threshold" =~ ^[0-9]+$ ]] || flap_threshold=0
+  local flap_threshold="${CABLE_MAX_FLAPS:-10}"
+  [[ "$flap_threshold" =~ ^[0-9]+$ ]] || flap_threshold=10
   if (( have_journalctl )); then
     flap_source=$(printf 'journalctl --since "%s days ago"' "$window_days")
     echo "[INFO] Checking journal for link flaps in the last ${window_days} days."
