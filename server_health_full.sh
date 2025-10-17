@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# server_health_full.sh (v2.3)
+# server_health_full.sh (v2.4)
 # 15 項整合式硬體/系統健檢 (BMC + OS；可整合 UPS)
 #
 #
@@ -1222,13 +1222,103 @@ parse_if_blocks(){
   ' "$lf" 2>/dev/null | sed '/^$/d'
 }
 
+filter_cabling_flap_lines(){
+  local uplink_str="$1"
+  local ignore_regex="${2:-}"
+
+  local -a uplink_tokens=()
+  if [[ -n "$uplink_str" ]]; then
+    IFS=',' read -ra uplink_tokens <<< "$uplink_str"
+    local i token trimmed
+    for i in "${!uplink_tokens[@]}"; do
+      token="${uplink_tokens[$i]}"
+      trimmed=$(echo "$token" | xargs)
+      uplink_tokens[$i]="$trimmed"
+    done
+  fi
+
+  local base_ignore_regex='^(lo|docker.*|br-.*|veth.*|cni.*|flannel.*|cali.*|tun.*|tap.*|virbr.*)$'
+  local driver_regex='(ixgbe|i40e|ice|igb|e1000e|mlx5|bnxt|bnx2x|tg3|qede|qlcnic|sfc|enic|virtio_net|virtio-net)'
+
+  local -a collected=()
+  local line line_lower first_token first_lower matched_pattern matched_iface token token_lower token_regex
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    line=${line//$'\r'/}
+    line_lower=${line,,}
+    matched_pattern=0
+    if [[ "$line_lower" == *"link is down"* ]] || [[ "$line_lower" == *"link is up"* ]] \
+       || [[ "$line_lower" == *"nic link is down"* ]] || [[ "$line_lower" == *"nic link is up"* ]] \
+       || [[ "$line_lower" == *"carrier lost"* ]] || [[ "$line_lower" == *"carrier detected"* ]] \
+       || [[ "$line_lower" == *"link down"* ]] || [[ "$line_lower" == *"link up"* ]]; then
+      matched_pattern=1
+    fi
+    (( matched_pattern )) || continue
+
+    matched_iface=0
+    if (( ${#uplink_tokens[@]} > 0 )); then
+      for token in "${uplink_tokens[@]}"; do
+        [[ -z "$token" ]] && continue
+        token_lower=${token,,}
+        token_regex="$token_lower"
+        token_regex=${token_regex//\\/\\\\}
+        token_regex=${token_regex//\//\\/}
+        token_regex=${token_regex//./\\.}
+        token_regex=${token_regex//\*/\\*}
+        token_regex=${token_regex//\+/\\+}
+        token_regex=${token_regex//\?/\\?}
+        token_regex=${token_regex//\{/\\{}
+        token_regex=${token_regex//\}/\\}}
+        token_regex=${token_regex//\[/\\[}
+        token_regex=${token_regex//\]/\\]}
+        token_regex=${token_regex//\^/\\^}
+        token_regex=${token_regex//\$/\\$}
+        token_regex=${token_regex//\(/\\(}
+        token_regex=${token_regex//\)/\\)}
+        token_regex=${token_regex//|/\\|}
+        token_regex=${token_regex//-/\\-}
+        if [[ "$line_lower" =~ (^|[^[:alnum:]_/.-])${token_regex}([^[:alnum:]_/.-]|$) ]]; then
+          matched_iface=1
+          break
+        fi
+      done
+      (( matched_iface )) || continue
+    else
+      first_token=${line%%[[:space:]]*}
+      first_token=${first_token%:}
+      first_lower=${first_token,,}
+      if [[ "$first_lower" =~ $base_ignore_regex ]]; then
+        continue
+      fi
+      if [[ -n "$ignore_regex" ]] && [[ "$first_lower" =~ $ignore_regex ]]; then
+        continue
+      fi
+      if [[ "$line_lower" =~ (eth[0-9]+|eno[0-9a-z:_./-]*|enp[0-9a-z:_./-]*|ens[0-9a-z:_./-]*|enx[0-9a-f:_./-]*|bond[0-9]+|team[0-9]+|p[0-9]+p[0-9]+) ]]; then
+        matched_iface=1
+      elif [[ "$line_lower" =~ $driver_regex ]]; then
+        matched_iface=1
+      fi
+      (( matched_iface )) || continue
+    fi
+
+    collected+=("$line")
+  done
+
+  if (( ${#collected[@]} > 0 )); then
+    printf '%s\n' "${collected[@]}"
+  fi
+  return 0
+}
+
 count_flaps(){
   local lf="$1"
-  # 只算 down/失去 carrier/重置，避免把 "link is up" 算進去
-  local n
-  n=$(grep -Eci 'link (is )?down|carrier lost|resetting' "$lf" 2>/dev/null || echo 0)
-  # 保證輸出是單一整數
-  echo "$n" | awk '{s+=$1} END{print (s+0)}'
+  local lines
+  lines=$(filter_cabling_flap_lines "${CABLE_UPLINK_IFACES:-}" "${CABLE_IGNORE_REGEX:-}" < "$lf")
+  if [[ -z "${lines:-}" ]]; then
+    echo 0
+    return
+  fi
+  printf '%s\n' "$lines" | wc -l | awk '{print $1}'
 }
 
 cabling_status_from_log(){
@@ -1237,6 +1327,8 @@ cabling_status_from_log(){
 
   local log_days="${LOG_DAYS:-7}"
   [[ "$log_days" =~ ^[0-9]+$ ]] || log_days=7
+  local flap_threshold="${CABLE_MAX_FLAPS:-0}"
+  [[ "$flap_threshold" =~ ^[0-9]+$ ]] || flap_threshold=0
 
   local missing_tools=()
   grep -qi 'ethtool not found' "$lf" && missing_tools+=("ethtool")
@@ -1340,17 +1432,20 @@ cabling_status_from_log(){
   local cabling_reason=""
 
   if (( uplink_total == 0 )); then
-    cabling_reason="no uplink list (--cable-uplink-ifaces)"
+    cabling_reason="未設定 uplink 清單（--cable-uplink-ifaces）"
   elif (( tools_missing )); then
     cabling_reason="$tools_state"
   else
     local has_flap_issue=0
-    if (( flaps > 0 )); then
+    if (( flaps > flap_threshold )); then
       has_flap_issue=1
     fi
     if (( uplink_bad == 0 && has_flap_issue == 0 )); then
       status="PASS"
       cabling_reason="Uplinks OK; no recent link flaps"
+      if (( flaps > 0 )); then
+        cabling_reason="Uplinks OK; flaps within threshold"
+      fi
     else
       status="WARN"
       if (( uplink_bad > 0 && has_flap_issue == 0 )); then
@@ -4882,18 +4977,22 @@ check_cabling() {
   local flap_source=""
   local flap_count=0
   local flap_count_available=0
+  local flap_threshold="${CABLE_MAX_FLAPS:-0}"
+  [[ "$flap_threshold" =~ ^[0-9]+$ ]] || flap_threshold=0
   if (( have_journalctl )); then
     flap_source=$(printf 'journalctl --since "%s days ago"' "$window_days")
     echo "[INFO] Checking journal for link flaps in the last ${window_days} days."
-    flap_output=$(journalctl --since "${window_days} days ago" 2>/dev/null | egrep -i 'link is (up|down)|carrier lost|resetting' || true)
-    if [[ -n "$flap_output" ]]; then
+    local raw_flap_lines=""
+    raw_flap_lines=$(journalctl --since "${window_days} days ago" 2>/dev/null | filter_cabling_flap_lines "$uplink_str" "${CABLE_IGNORE_REGEX:-}" || true)
+    if [[ -n "$raw_flap_lines" ]]; then
       flap_count_available=1
-      flap_count=$(printf '%s\n' "$flap_output" | grep -c .)
+      flap_count=$(printf '%s\n' "$raw_flap_lines" | wc -l | awk '{print $1}')
+      flap_output=$(printf '%s\n' "$raw_flap_lines" | head -n 10)
     fi
   else
     flap_source="dmesg tail"
     echo "[WARN] journalctl not found, falling back to dmesg for link flaps."
-    flap_output=$(sudo dmesg 2>/dev/null | egrep -i 'link is (up|down)|carrier lost|resetting' | tail -n 60 || true)
+    flap_output=$(sudo dmesg 2>/dev/null | filter_cabling_flap_lines "$uplink_str" "${CABLE_IGNORE_REGEX:-}" | head -n 10 || true)
   fi
   if [[ -n "$flap_output" ]]; then
     echo "$flap_output"
@@ -4960,13 +5059,13 @@ check_cabling() {
   local cabling_status=""
   local cabling_reason=""
   local has_flap_issue=0
-  if (( flap_count_available )) && (( flap_count > 0 )); then
+  if (( flap_count_available )) && (( flap_count > flap_threshold )); then
     has_flap_issue=1
   fi
 
   if (( uplink_total == 0 )); then
     cabling_status="INFO"
-    cabling_reason="no uplink list (--cable-uplink-ifaces)"
+    cabling_reason="未設定 uplink 清單（--cable-uplink-ifaces）"
   elif (( ! have_ethtool || ! have_journalctl )); then
     cabling_status="INFO"
     cabling_reason="$tools_state"
@@ -4974,6 +5073,9 @@ check_cabling() {
     if (( uplink_bad == 0 )) && (( has_flap_issue == 0 )); then
       cabling_status="PASS"
       cabling_reason="Uplinks OK; no recent link flaps"
+      if (( flap_count_available )) && (( flap_count > 0 )); then
+        cabling_reason="Uplinks OK; flaps within threshold"
+      fi
     else
       cabling_status="WARN"
       if (( uplink_bad > 0 )) && (( has_flap_issue == 0 )); then
@@ -5013,11 +5115,12 @@ check_cabling() {
     --argjson bad "$uplink_bad" \
     --arg tools "$tools_state" \
     --arg days "$window_days" \
-    '{uplinks:$uplinks, flap_count:$flap, uplink_total:$total, uplink_bad:$bad, window_days:($days|tonumber), tools:$tools}')
+    --arg max "$flap_threshold" \
+    '{uplinks:$uplinks, flap_count:$flap, uplink_total:$total, uplink_bad:$bad, window_days:($days|tonumber), flap_threshold:($max|tonumber), tools:$tools}')
 
   local flap_preview=""
   if [[ -n "$flap_output" ]]; then
-    flap_preview=$(printf '%s\n' "$flap_output" | head -n 20)
+    flap_preview=$(printf '%s\n' "$flap_output" | head -n 10)
   fi
   local evidence_json
   evidence_json=$(jq -n \
@@ -5030,8 +5133,15 @@ check_cabling() {
       log_txt:$log_txt
     }')
 
-  local pass_rules="[\"所有 uplink link=yes 且 duplex=Full 且 speed>0\",\"最近 ${window_days} 天內 flap_count=0\"]"
-  local warn_rules="[\"任一 uplink 連線狀態或速率異常\",\"最近 ${window_days} 天內 flap_count>0\"]"
+  local pass_rules=""
+  local warn_rules=""
+  if (( flap_threshold > 0 )); then
+    pass_rules="[\"所有 uplink link=yes 且 duplex=Full 且 speed>0\",\"最近 ${window_days} 天內 flap_count <= ${flap_threshold}\"]"
+    warn_rules="[\"任一 uplink 連線狀態或速率異常\",\"最近 ${window_days} 天內 flap_count > ${flap_threshold}\"]"
+  else
+    pass_rules="[\"所有 uplink link=yes 且 duplex=Full 且 speed>0\",\"最近 ${window_days} 天內 flap_count=0\"]"
+    warn_rules="[\"任一 uplink 連線狀態或速率異常\",\"最近 ${window_days} 天內 flap_count>0\"]"
+  fi
   local fail_rules='[]'
   local info_rules='["未提供 uplink 清單或缺少 ethtool/journalctl"]'
 
@@ -5042,18 +5152,26 @@ check_cabling() {
     --argjson flap "$flap_count_json" \
     --arg tools "$tools_state" \
     --arg status "$cabling_status" \
+    --arg detail "$reason_text" \
+    --arg max "$flap_threshold" \
     '[
       {"name":"Configured uplinks", "ok":($uplink_total>0), "value":($uplink_total|tostring)},
       {"name":"Tool availability", "ok":($tools=="ready"), "value":$tools},
       {"name":"Healthy uplinks", "ok":($uplink_bad==0), "value":("bad="+($uplink_bad|tostring))},
-      {"name":"Flap count (last window)", "ok":(($flap==0) or ($flap==null)), "value":(if $flap==null then "N/A" else ($flap|tostring) end)},
-      {"name":"Status", "ok":($status=="PASS"), "value":$status}
+      {"name":"Flaps within threshold", "ok":(($flap==null) or ($flap<=($max|tonumber))), "value":(if $flap==null then "N/A" else ("flaps="+($flap|tostring)+"/max="+(($max|tonumber)|tostring)) end)},
+      {"name":"Status", "ok":($status=="PASS"), "value":$status},
+      {"name":"Details", "ok":true, "value":$detail}
     ]')
 
   local th_json
-  th_json=$(jq -n --arg days "$window_days" '{"LOG_DAYS":($days|tonumber)}')
+  th_json=$(jq -n --arg days "$window_days" --arg max "$flap_threshold" '{"LOG_DAYS":($days|tonumber), "CABLE_MAX_FLAPS":($max|tonumber)}')
 
-  local criteria="uplink link=yes, duplex=Full, speed>0, and no flaps within ${window_days} 天"
+  local criteria=""
+  if (( flap_threshold > 0 )); then
+    criteria="uplink link=yes, duplex=Full, speed>0, and flaps <= ${flap_threshold} within ${window_days} 天"
+  else
+    criteria="uplink link=yes, duplex=Full, speed>0, and no flaps within ${window_days} 天"
+  fi
   local jdg_json
   jdg_json=$(jq -n \
     --arg criteria "$criteria" \
